@@ -54,6 +54,8 @@ MODULE_FIRMWARE("amdgpu/gc_11_5_1_mes_2.bin");
 MODULE_FIRMWARE("amdgpu/gc_11_5_1_mes1.bin");
 MODULE_FIRMWARE("amdgpu/gc_11_5_2_mes_2.bin");
 MODULE_FIRMWARE("amdgpu/gc_11_5_2_mes1.bin");
+MODULE_FIRMWARE("amdgpu/gc_11_5_3_mes_2.bin");
+MODULE_FIRMWARE("amdgpu/gc_11_5_3_mes1.bin");
 
 static int mes_v11_0_hw_init(struct amdgpu_ip_block *ip_block);
 static int mes_v11_0_hw_fini(struct amdgpu_ip_block *ip_block);
@@ -62,6 +64,7 @@ static int mes_v11_0_kiq_hw_fini(struct amdgpu_device *adev);
 
 #define MES_EOP_SIZE   2048
 #define GFX_MES_DRAM_SIZE	0x80000
+#define MES11_HW_RESOURCE_1_SIZE (128 * AMDGPU_GPU_PAGE_SIZE)
 
 static void mes_v11_0_ring_set_wptr(struct amdgpu_ring *ring)
 {
@@ -477,7 +480,7 @@ static int mes_v11_0_reset_hw_queue(struct amdgpu_mes *mes,
 
 	return mes_v11_0_submit_pkt_and_poll_completion(mes,
 			&mes_reset_queue_pkt, sizeof(mes_reset_queue_pkt),
-			offsetof(union MESAPI__REMOVE_QUEUE, api_status));
+			offsetof(union MESAPI__RESET, api_status));
 }
 
 static int mes_v11_0_map_legacy_queue(struct amdgpu_mes *mes,
@@ -666,6 +669,18 @@ static int mes_v11_0_misc_op(struct amdgpu_mes *mes,
 			offsetof(union MESAPI__MISC, api_status));
 }
 
+static void mes_v11_0_set_gfx_hqd_mask(union MESAPI_SET_HW_RESOURCES *pkt)
+{
+	/*
+	 * GFX pipe 0 queue 0 is being used by Kernel queue.
+	 * Set GFX pipe 0 queue 1 for MES scheduling
+	 * mask = 10b
+	 * GFX pipe 1 can't be used for MES due to HW limitation.
+	 */
+	pkt->gfx_hqd_mask[0] = 0x2;
+	pkt->gfx_hqd_mask[1] = 0;
+}
+
 static int mes_v11_0_set_hw_resources(struct amdgpu_mes *mes)
 {
 	int i;
@@ -690,8 +705,7 @@ static int mes_v11_0_set_hw_resources(struct amdgpu_mes *mes)
 		mes_set_hw_res_pkt.compute_hqd_mask[i] =
 			mes->compute_hqd_mask[i];
 
-	for (i = 0; i < MAX_GFX_PIPES; i++)
-		mes_set_hw_res_pkt.gfx_hqd_mask[i] = mes->gfx_hqd_mask[i];
+	mes_v11_0_set_gfx_hqd_mask(&mes_set_hw_res_pkt);
 
 	for (i = 0; i < MAX_SDMA_PIPES; i++)
 		mes_set_hw_res_pkt.sdma_hqd_mask[i] = mes->sdma_hqd_mask[i];
@@ -730,9 +744,6 @@ static int mes_v11_0_set_hw_resources(struct amdgpu_mes *mes)
 
 static int mes_v11_0_set_hw_resources_1(struct amdgpu_mes *mes)
 {
-	int size = 128 * PAGE_SIZE;
-	int ret = 0;
-	struct amdgpu_device *adev = mes->adev;
 	union MESAPI_SET_HW_RESOURCES_1 mes_set_hw_res_pkt;
 	memset(&mes_set_hw_res_pkt, 0, sizeof(mes_set_hw_res_pkt));
 
@@ -741,18 +752,13 @@ static int mes_v11_0_set_hw_resources_1(struct amdgpu_mes *mes)
 	mes_set_hw_res_pkt.header.dwsize = API_FRAME_SIZE_IN_DWORDS;
 	mes_set_hw_res_pkt.enable_mes_info_ctx = 1;
 
-	ret = amdgpu_bo_create_kernel(adev, size, PAGE_SIZE,
-				AMDGPU_GEM_DOMAIN_VRAM,
-				&mes->resource_1,
-				&mes->resource_1_gpu_addr,
-				&mes->resource_1_addr);
-	if (ret) {
-		dev_err(adev->dev, "(%d) failed to create mes resource_1 bo\n", ret);
-		return ret;
+	mes_set_hw_res_pkt.cleaner_shader_fence_mc_addr = mes->resource_1_gpu_addr[0];
+	if (amdgpu_sriov_is_mes_info_enable(mes->adev)) {
+		mes_set_hw_res_pkt.mes_info_ctx_mc_addr =
+			mes->resource_1_gpu_addr[0] + AMDGPU_GPU_PAGE_SIZE;
+		mes_set_hw_res_pkt.mes_info_ctx_size = MES11_HW_RESOURCE_1_SIZE;
 	}
 
-	mes_set_hw_res_pkt.mes_info_ctx_mc_addr = mes->resource_1_gpu_addr;
-	mes_set_hw_res_pkt.mes_info_ctx_size = mes->resource_1->tbo.base.size;
 	return mes_v11_0_submit_pkt_and_poll_completion(mes,
 			&mes_set_hw_res_pkt, sizeof(mes_set_hw_res_pkt),
 			offsetof(union MESAPI_SET_HW_RESOURCES_1, api_status));
@@ -808,7 +814,7 @@ static const struct amdgpu_mes_funcs mes_v11_0_funcs = {
 };
 
 static int mes_v11_0_allocate_ucode_buffer(struct amdgpu_device *adev,
-					   enum admgpu_mes_pipe pipe)
+					   enum amdgpu_mes_pipe pipe)
 {
 	int r;
 	const struct mes_firmware_header_v1_0 *mes_hdr;
@@ -843,7 +849,7 @@ static int mes_v11_0_allocate_ucode_buffer(struct amdgpu_device *adev,
 }
 
 static int mes_v11_0_allocate_ucode_data_buffer(struct amdgpu_device *adev,
-						enum admgpu_mes_pipe pipe)
+						enum amdgpu_mes_pipe pipe)
 {
 	int r;
 	const struct mes_firmware_header_v1_0 *mes_hdr;
@@ -884,7 +890,7 @@ static int mes_v11_0_allocate_ucode_data_buffer(struct amdgpu_device *adev,
 }
 
 static void mes_v11_0_free_ucode_buffers(struct amdgpu_device *adev,
-					 enum admgpu_mes_pipe pipe)
+					 enum amdgpu_mes_pipe pipe)
 {
 	amdgpu_bo_free_kernel(&adev->mes.data_fw_obj[pipe],
 			      &adev->mes.data_fw_gpu_addr[pipe],
@@ -898,6 +904,10 @@ static void mes_v11_0_free_ucode_buffers(struct amdgpu_device *adev,
 static void mes_v11_0_get_fw_version(struct amdgpu_device *adev)
 {
 	int pipe;
+
+	/* return early if we have already fetched these */
+	if (adev->mes.sched_version && adev->mes.kiq_version)
+		return;
 
 	/* get MES scheduler/KIQ versions */
 	mutex_lock(&adev->srbm_mutex);
@@ -982,7 +992,7 @@ static void mes_v11_0_enable(struct amdgpu_device *adev, bool enable)
 
 /* This function is for backdoor MES firmware */
 static int mes_v11_0_load_microcode(struct amdgpu_device *adev,
-				    enum admgpu_mes_pipe pipe, bool prime_icache)
+				    enum amdgpu_mes_pipe pipe, bool prime_icache)
 {
 	int r;
 	uint32_t data;
@@ -1054,7 +1064,7 @@ static int mes_v11_0_load_microcode(struct amdgpu_device *adev,
 }
 
 static int mes_v11_0_allocate_eop_buf(struct amdgpu_device *adev,
-				      enum admgpu_mes_pipe pipe)
+				      enum amdgpu_mes_pipe pipe)
 {
 	int r;
 	u32 *eop;
@@ -1265,7 +1275,7 @@ static int mes_v11_0_kiq_enable_queue(struct amdgpu_device *adev)
 }
 
 static int mes_v11_0_queue_init(struct amdgpu_device *adev,
-				enum admgpu_mes_pipe pipe)
+				enum amdgpu_mes_pipe pipe)
 {
 	struct amdgpu_ring *ring;
 	int r;
@@ -1348,7 +1358,7 @@ static int mes_v11_0_kiq_ring_init(struct amdgpu_device *adev)
 }
 
 static int mes_v11_0_mqd_sw_init(struct amdgpu_device *adev,
-				 enum admgpu_mes_pipe pipe)
+				 enum amdgpu_mes_pipe pipe)
 {
 	int r, mqd_size = sizeof(struct v11_compute_mqd);
 	struct amdgpu_ring *ring;
@@ -1389,7 +1399,7 @@ static int mes_v11_0_mqd_sw_init(struct amdgpu_device *adev,
 static int mes_v11_0_sw_init(struct amdgpu_ip_block *ip_block)
 {
 	struct amdgpu_device *adev = ip_block->adev;
-	int pipe, r;
+	int pipe, r, bo_size;
 
 	adev->mes.funcs = &mes_v11_0_funcs;
 	adev->mes.kiq_hw_init = &mes_v11_0_kiq_hw_init;
@@ -1424,6 +1434,23 @@ static int mes_v11_0_sw_init(struct amdgpu_ip_block *ip_block)
 	if (r)
 		return r;
 
+	bo_size = AMDGPU_GPU_PAGE_SIZE;
+	if (amdgpu_sriov_is_mes_info_enable(adev))
+		bo_size += MES11_HW_RESOURCE_1_SIZE;
+
+	/* Only needed for AMDGPU_MES_SCHED_PIPE on MES 11*/
+	r = amdgpu_bo_create_kernel(adev,
+				    bo_size,
+				    PAGE_SIZE,
+				    AMDGPU_GEM_DOMAIN_VRAM,
+				    &adev->mes.resource_1[0],
+				    &adev->mes.resource_1_gpu_addr[0],
+				    &adev->mes.resource_1_addr[0]);
+	if (r) {
+		dev_err(adev->dev, "(%d) failed to create mes resource_1 bo\n", r);
+		return r;
+	}
+
 	return 0;
 }
 
@@ -1431,6 +1458,9 @@ static int mes_v11_0_sw_fini(struct amdgpu_ip_block *ip_block)
 {
 	struct amdgpu_device *adev = ip_block->adev;
 	int pipe;
+
+	amdgpu_bo_free_kernel(&adev->mes.resource_1[0], &adev->mes.resource_1_gpu_addr[0],
+			      &adev->mes.resource_1_addr[0]);
 
 	for (pipe = 0; pipe < AMDGPU_MAX_MES_PIPES; pipe++) {
 		kfree(adev->mes.mqd_backup[pipe]);
@@ -1505,9 +1535,7 @@ static void mes_v11_0_kiq_setting(struct amdgpu_ring *ring)
 	tmp = RREG32_SOC15(GC, 0, regRLC_CP_SCHEDULERS);
 	tmp &= 0xffffff00;
 	tmp |= (ring->me << 5) | (ring->pipe << 3) | (ring->queue);
-	WREG32_SOC15(GC, 0, regRLC_CP_SCHEDULERS, tmp);
-	tmp |= 0x80;
-	WREG32_SOC15(GC, 0, regRLC_CP_SCHEDULERS, tmp);
+	WREG32_SOC15(GC, 0, regRLC_CP_SCHEDULERS, tmp | 0x80);
 }
 
 static void mes_v11_0_kiq_clear(struct amdgpu_device *adev)
@@ -1621,12 +1649,10 @@ static int mes_v11_0_hw_init(struct amdgpu_ip_block *ip_block)
 	if (r)
 		goto failure;
 
-	if (amdgpu_sriov_is_mes_info_enable(adev)) {
-		r = mes_v11_0_set_hw_resources_1(&adev->mes);
-		if (r) {
-			DRM_ERROR("failed mes_v11_0_set_hw_resources_1, r=%d\n", r);
-			goto failure;
-		}
+	r = mes_v11_0_set_hw_resources_1(&adev->mes);
+	if (r) {
+		DRM_ERROR("failed mes_v11_0_set_hw_resources_1, r=%d\n", r);
+		goto failure;
 	}
 
 	r = mes_v11_0_query_sched_status(&adev->mes);
@@ -1634,6 +1660,10 @@ static int mes_v11_0_hw_init(struct amdgpu_ip_block *ip_block)
 		DRM_ERROR("MES is busy\n");
 		goto failure;
 	}
+
+	r = amdgpu_mes_update_enforce_isolation(adev);
+	if (r)
+		goto failure;
 
 out:
 	/*
@@ -1653,34 +1683,17 @@ failure:
 
 static int mes_v11_0_hw_fini(struct amdgpu_ip_block *ip_block)
 {
-	struct amdgpu_device *adev = ip_block->adev;
-	if (amdgpu_sriov_is_mes_info_enable(adev)) {
-		amdgpu_bo_free_kernel(&adev->mes.resource_1, &adev->mes.resource_1_gpu_addr,
-					&adev->mes.resource_1_addr);
-	}
 	return 0;
 }
 
 static int mes_v11_0_suspend(struct amdgpu_ip_block *ip_block)
 {
-	int r;
-
-	r = amdgpu_mes_suspend(ip_block->adev);
-	if (r)
-		return r;
-
 	return mes_v11_0_hw_fini(ip_block);
 }
 
 static int mes_v11_0_resume(struct amdgpu_ip_block *ip_block)
 {
-	int r;
-
-	r = mes_v11_0_hw_init(ip_block);
-	if (r)
-		return r;
-
-	return amdgpu_mes_resume(ip_block->adev);
+	return mes_v11_0_hw_init(ip_block);
 }
 
 static int mes_v11_0_early_init(struct amdgpu_ip_block *ip_block)

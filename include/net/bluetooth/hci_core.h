@@ -157,8 +157,9 @@ struct bdaddr_list_with_irk {
 
 /* Bitmask of connection flags */
 enum hci_conn_flags {
-	HCI_CONN_FLAG_REMOTE_WAKEUP = 1,
-	HCI_CONN_FLAG_DEVICE_PRIVACY = 2,
+	HCI_CONN_FLAG_REMOTE_WAKEUP = BIT(0),
+	HCI_CONN_FLAG_DEVICE_PRIVACY = BIT(1),
+	HCI_CONN_FLAG_ADDRESS_RESOLUTION = BIT(2),
 };
 typedef u8 hci_conn_flags_t;
 
@@ -258,6 +259,12 @@ struct adv_info {
 	bdaddr_t	random_addr;
 	bool 		rpa_expired;
 	struct delayed_work	rpa_expired_cb;
+};
+
+struct tx_queue {
+	struct sk_buff_head queue;
+	unsigned int extra;
+	unsigned int tracked;
 };
 
 #define HCI_MAX_ADV_INSTANCES		5
@@ -538,6 +545,7 @@ struct hci_dev {
 	struct hci_conn_hash	conn_hash;
 
 	struct list_head	mesh_pending;
+	struct mutex		mgmt_pending_lock;
 	struct list_head	mgmt_pending;
 	struct list_head	reject_list;
 	struct list_head	accept_list;
@@ -632,7 +640,6 @@ struct hci_dev {
 	int (*post_init)(struct hci_dev *hdev);
 	int (*set_diag)(struct hci_dev *hdev, bool enable);
 	int (*set_bdaddr)(struct hci_dev *hdev, const bdaddr_t *bdaddr);
-	void (*cmd_timeout)(struct hci_dev *hdev);
 	void (*reset)(struct hci_dev *hdev);
 	bool (*wakeup)(struct hci_dev *hdev);
 	int (*set_quality_report)(struct hci_dev *hdev, bool enable);
@@ -732,6 +739,8 @@ struct hci_conn {
 
 	struct sk_buff_head data_q;
 	struct list_head chan_list;
+
+	struct tx_queue tx_q;
 
 	struct delayed_work disc_work;
 	struct delayed_work auto_accept_work;
@@ -988,7 +997,8 @@ static inline void hci_conn_hash_add(struct hci_dev *hdev, struct hci_conn *c)
 	case ESCO_LINK:
 		h->sco_num++;
 		break;
-	case ISO_LINK:
+	case CIS_LINK:
+	case BIS_LINK:
 		h->iso_num++;
 		break;
 	}
@@ -1014,7 +1024,8 @@ static inline void hci_conn_hash_del(struct hci_dev *hdev, struct hci_conn *c)
 	case ESCO_LINK:
 		h->sco_num--;
 		break;
-	case ISO_LINK:
+	case CIS_LINK:
+	case BIS_LINK:
 		h->iso_num--;
 		break;
 	}
@@ -1031,7 +1042,8 @@ static inline unsigned int hci_conn_num(struct hci_dev *hdev, __u8 type)
 	case SCO_LINK:
 	case ESCO_LINK:
 		return h->sco_num;
-	case ISO_LINK:
+	case CIS_LINK:
+	case BIS_LINK:
 		return h->iso_num;
 	default:
 		return 0;
@@ -1092,7 +1104,7 @@ static inline struct hci_conn *hci_conn_hash_lookup_bis(struct hci_dev *hdev,
 	rcu_read_lock();
 
 	list_for_each_entry_rcu(c, &h->list, list) {
-		if (bacmp(&c->dst, ba) || c->type != ISO_LINK)
+		if (bacmp(&c->dst, ba) || c->type != BIS_LINK)
 			continue;
 
 		if (c->iso_qos.bcast.bis == bis) {
@@ -1105,10 +1117,8 @@ static inline struct hci_conn *hci_conn_hash_lookup_bis(struct hci_dev *hdev,
 	return NULL;
 }
 
-static inline struct hci_conn *hci_conn_hash_lookup_sid(struct hci_dev *hdev,
-							__u8 sid,
-							bdaddr_t *dst,
-							__u8 dst_type)
+static inline struct hci_conn *
+hci_conn_hash_lookup_create_pa_sync(struct hci_dev *hdev)
 {
 	struct hci_conn_hash *h = &hdev->conn_hash;
 	struct hci_conn  *c;
@@ -1116,8 +1126,10 @@ static inline struct hci_conn *hci_conn_hash_lookup_sid(struct hci_dev *hdev,
 	rcu_read_lock();
 
 	list_for_each_entry_rcu(c, &h->list, list) {
-		if (c->type != ISO_LINK  || bacmp(&c->dst, dst) ||
-		    c->dst_type != dst_type || c->sid != sid)
+		if (c->type != BIS_LINK)
+			continue;
+
+		if (!test_bit(HCI_CONN_CREATE_PA_SYNC, &c->flags))
 			continue;
 
 		rcu_read_unlock();
@@ -1140,8 +1152,8 @@ hci_conn_hash_lookup_per_adv_bis(struct hci_dev *hdev,
 	rcu_read_lock();
 
 	list_for_each_entry_rcu(c, &h->list, list) {
-		if (bacmp(&c->dst, ba) || c->type != ISO_LINK ||
-			!test_bit(HCI_CONN_PER_ADV, &c->flags))
+		if (bacmp(&c->dst, ba) || c->type != BIS_LINK ||
+		    !test_bit(HCI_CONN_PER_ADV, &c->flags))
 			continue;
 
 		if (c->iso_qos.bcast.big == big &&
@@ -1230,7 +1242,7 @@ static inline struct hci_conn *hci_conn_hash_lookup_cis(struct hci_dev *hdev,
 	rcu_read_lock();
 
 	list_for_each_entry_rcu(c, &h->list, list) {
-		if (c->type != ISO_LINK || !bacmp(&c->dst, BDADDR_ANY))
+		if (c->type != CIS_LINK)
 			continue;
 
 		/* Match CIG ID if set */
@@ -1262,7 +1274,7 @@ static inline struct hci_conn *hci_conn_hash_lookup_cig(struct hci_dev *hdev,
 	rcu_read_lock();
 
 	list_for_each_entry_rcu(c, &h->list, list) {
-		if (c->type != ISO_LINK || !bacmp(&c->dst, BDADDR_ANY))
+		if (c->type != CIS_LINK)
 			continue;
 
 		if (handle == c->iso_qos.ucast.cig) {
@@ -1285,17 +1297,7 @@ static inline struct hci_conn *hci_conn_hash_lookup_big(struct hci_dev *hdev,
 	rcu_read_lock();
 
 	list_for_each_entry_rcu(c, &h->list, list) {
-		if (c->type != ISO_LINK)
-			continue;
-
-		/* An ISO_LINK hcon with BDADDR_ANY as destination
-		 * address is a Broadcast connection. A Broadcast
-		 * slave connection is associated with a PA train,
-		 * so the sync_handle can be used to differentiate
-		 * from unicast.
-		 */
-		if (bacmp(&c->dst, BDADDR_ANY) &&
-		    c->sync_handle == HCI_SYNC_HANDLE_INVALID)
+		if (c->type != BIS_LINK)
 			continue;
 
 		if (handle == c->iso_qos.bcast.big) {
@@ -1319,7 +1321,7 @@ hci_conn_hash_lookup_big_sync_pend(struct hci_dev *hdev,
 	rcu_read_lock();
 
 	list_for_each_entry_rcu(c, &h->list, list) {
-		if (c->type != ISO_LINK)
+		if (c->type != BIS_LINK)
 			continue;
 
 		if (handle == c->iso_qos.bcast.big && num_bis == c->num_bis) {
@@ -1342,8 +1344,8 @@ hci_conn_hash_lookup_big_state(struct hci_dev *hdev, __u8 handle,  __u16 state)
 	rcu_read_lock();
 
 	list_for_each_entry_rcu(c, &h->list, list) {
-		if (bacmp(&c->dst, BDADDR_ANY) || c->type != ISO_LINK ||
-			c->state != state)
+		if (c->type != BIS_LINK || bacmp(&c->dst, BDADDR_ANY) ||
+		    c->state != state)
 			continue;
 
 		if (handle == c->iso_qos.bcast.big) {
@@ -1366,8 +1368,8 @@ hci_conn_hash_lookup_pa_sync_big_handle(struct hci_dev *hdev, __u8 big)
 	rcu_read_lock();
 
 	list_for_each_entry_rcu(c, &h->list, list) {
-		if (c->type != ISO_LINK ||
-			!test_bit(HCI_CONN_PA_SYNC, &c->flags))
+		if (c->type != BIS_LINK ||
+		    !test_bit(HCI_CONN_PA_SYNC, &c->flags))
 			continue;
 
 		if (c->iso_qos.bcast.big == big) {
@@ -1389,7 +1391,7 @@ hci_conn_hash_lookup_pa_sync_handle(struct hci_dev *hdev, __u16 sync_handle)
 	rcu_read_lock();
 
 	list_for_each_entry_rcu(c, &h->list, list) {
-		if (c->type != ISO_LINK)
+		if (c->type != BIS_LINK)
 			continue;
 
 		/* Ignore the listen hcon, we are looking
@@ -1516,8 +1518,6 @@ bool hci_setup_sync(struct hci_conn *conn, __u16 handle);
 void hci_sco_setup(struct hci_conn *conn, __u8 status);
 bool hci_iso_setup_path(struct hci_conn *conn);
 int hci_le_create_cis_pending(struct hci_dev *hdev);
-int hci_pa_create_sync_pending(struct hci_dev *hdev);
-int hci_le_big_create_sync_pending(struct hci_dev *hdev);
 int hci_conn_check_create_cis(struct hci_conn *conn);
 
 struct hci_conn *hci_conn_add(struct hci_dev *hdev, int type, bdaddr_t *dst,
@@ -1558,9 +1558,9 @@ struct hci_conn *hci_connect_bis(struct hci_dev *hdev, bdaddr_t *dst,
 				 __u8 data_len, __u8 *data);
 struct hci_conn *hci_pa_create_sync(struct hci_dev *hdev, bdaddr_t *dst,
 		       __u8 dst_type, __u8 sid, struct bt_iso_qos *qos);
-int hci_le_big_create_sync(struct hci_dev *hdev, struct hci_conn *hcon,
-			   struct bt_iso_qos *qos,
-			   __u16 sync_handle, __u8 num_bis, __u8 bis[]);
+int hci_conn_big_create_sync(struct hci_dev *hdev, struct hci_conn *hcon,
+			     struct bt_iso_qos *qos, __u16 sync_handle,
+			     __u8 num_bis, __u8 bis[]);
 int hci_conn_check_link_mode(struct hci_conn *conn);
 int hci_conn_check_secure(struct hci_conn *conn, __u8 sec_level);
 int hci_conn_security(struct hci_conn *conn, __u8 sec_level, __u8 auth_type,
@@ -1571,6 +1571,18 @@ void hci_conn_enter_active_mode(struct hci_conn *conn, __u8 force_active);
 
 void hci_conn_failed(struct hci_conn *conn, u8 status);
 u8 hci_conn_set_handle(struct hci_conn *conn, u16 handle);
+
+void hci_conn_tx_queue(struct hci_conn *conn, struct sk_buff *skb);
+void hci_conn_tx_dequeue(struct hci_conn *conn);
+void hci_setup_tx_timestamp(struct sk_buff *skb, size_t key_offset,
+			    const struct sockcm_cookie *sockc);
+
+static inline void hci_sockcm_init(struct sockcm_cookie *sockc, struct sock *sk)
+{
+	*sockc = (struct sockcm_cookie) {
+		.tsflags = READ_ONCE(sk->sk_tsflags),
+	};
+}
 
 /*
  * hci_conn_get() and hci_conn_put() are used to control the life-time of an
@@ -1760,8 +1772,6 @@ int hci_bdaddr_list_add_with_flags(struct list_head *list, bdaddr_t *bdaddr,
 int hci_bdaddr_list_del(struct list_head *list, bdaddr_t *bdaddr, u8 type);
 int hci_bdaddr_list_del_with_irk(struct list_head *list, bdaddr_t *bdaddr,
 				 u8 type);
-int hci_bdaddr_list_del_with_flags(struct list_head *list, bdaddr_t *bdaddr,
-				   u8 type);
 void hci_bdaddr_list_clear(struct list_head *list);
 
 struct hci_conn_params *hci_conn_params_lookup(struct hci_dev *hdev,
@@ -1782,6 +1792,7 @@ struct hci_conn_params *hci_pend_le_action_lookup(struct list_head *list,
 void hci_uuids_clear(struct hci_dev *hdev);
 
 void hci_link_keys_clear(struct hci_dev *hdev);
+u8 *hci_conn_key_enc_size(struct hci_conn *conn);
 struct link_key *hci_find_link_key(struct hci_dev *hdev, bdaddr_t *bdaddr);
 struct link_key *hci_add_link_key(struct hci_dev *hdev, struct hci_conn *conn,
 				  bdaddr_t *bdaddr, u8 *val, u8 type,
@@ -1860,6 +1871,7 @@ void hci_conn_del_sysfs(struct hci_conn *conn);
 #define lmp_hold_capable(dev)      ((dev)->features[0][0] & LMP_HOLD)
 #define lmp_sniff_capable(dev)     ((dev)->features[0][0] & LMP_SNIFF)
 #define lmp_park_capable(dev)      ((dev)->features[0][1] & LMP_PARK)
+#define lmp_sco_capable(dev)       ((dev)->features[0][1] & LMP_SCO)
 #define lmp_inq_rssi_capable(dev)  ((dev)->features[0][3] & LMP_RSSI_INQ)
 #define lmp_esco_capable(dev)      ((dev)->features[0][3] & LMP_ESCO)
 #define lmp_bredr_capable(dev)     (!((dev)->features[0][4] & LMP_NO_BREDR))
@@ -1920,16 +1932,16 @@ void hci_conn_del_sysfs(struct hci_conn *conn);
 
 #define ll_privacy_capable(dev) ((dev)->le_features[0] & HCI_LE_LL_PRIVACY)
 
-/* Use LL Privacy based address resolution if supported */
-#define use_ll_privacy(dev) (ll_privacy_capable(dev) && \
-			     hci_dev_test_flag(dev, HCI_ENABLE_LL_PRIVACY))
-
-#define privacy_mode_capable(dev) (use_ll_privacy(dev) && \
+#define privacy_mode_capable(dev) (ll_privacy_capable(dev) && \
 				   (hdev->commands[39] & 0x04))
 
 #define read_key_size_capable(dev) \
 	((dev)->commands[20] & 0x10 && \
 	 !test_bit(HCI_QUIRK_BROKEN_READ_ENC_KEY_SIZE, &hdev->quirks))
+
+#define read_voice_setting_capable(dev) \
+	((dev)->commands[9] & 0x04 && \
+	 !test_bit(HCI_QUIRK_BROKEN_READ_VOICE_SETTING, &(dev)->quirks))
 
 /* Use enhanced synchronous connection if command is supported and its quirk
  * has not been set.
@@ -1994,7 +2006,8 @@ static inline int hci_proto_connect_ind(struct hci_dev *hdev, bdaddr_t *bdaddr,
 	case ESCO_LINK:
 		return sco_connect_ind(hdev, bdaddr, flags);
 
-	case ISO_LINK:
+	case CIS_LINK:
+	case BIS_LINK:
 		return iso_connect_ind(hdev, bdaddr, flags);
 
 	default:
@@ -2360,8 +2373,6 @@ void mgmt_auth_enable_complete(struct hci_dev *hdev, u8 status);
 void mgmt_set_class_of_dev_complete(struct hci_dev *hdev, u8 *dev_class,
 				    u8 status);
 void mgmt_set_local_name_complete(struct hci_dev *hdev, u8 *name, u8 status);
-void mgmt_start_discovery_complete(struct hci_dev *hdev, u8 status);
-void mgmt_stop_discovery_complete(struct hci_dev *hdev, u8 status);
 void mgmt_device_found(struct hci_dev *hdev, bdaddr_t *bdaddr, u8 link_type,
 		       u8 addr_type, u8 *dev_class, s8 rssi, u32 flags,
 		       u8 *eir, u16 eir_len, u8 *scan_rsp, u8 scan_rsp_len,
@@ -2387,7 +2398,6 @@ void mgmt_advertising_added(struct sock *sk, struct hci_dev *hdev,
 			    u8 instance);
 void mgmt_advertising_removed(struct sock *sk, struct hci_dev *hdev,
 			      u8 instance);
-void mgmt_adv_monitor_removed(struct hci_dev *hdev, u16 handle);
 int mgmt_phy_configuration_changed(struct hci_dev *hdev, struct sock *skip);
 void mgmt_adv_monitor_device_lost(struct hci_dev *hdev, u16 handle,
 				  bdaddr_t *bdaddr, u8 addr_type);

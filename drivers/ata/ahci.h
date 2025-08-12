@@ -246,6 +246,8 @@ enum {
 	AHCI_HFLAG_NO_SXS		= BIT(26), /* SXS not supported */
 	AHCI_HFLAG_43BIT_ONLY		= BIT(27), /* 43bit DMA addr limit */
 	AHCI_HFLAG_INTEL_PCS_QUIRK	= BIT(28), /* apply Intel PCS quirk */
+	AHCI_HFLAG_ATAPI_DMA_QUIRK	= BIT(29), /* force ATAPI to use DMA */
+	AHCI_HFLAG_31BIT_ONLY 		= BIT(30), /* 31bit DMA addr limit */
 
 	/* ap->flags bits */
 
@@ -328,7 +330,7 @@ struct ahci_port_priv {
 struct ahci_host_priv {
 	/* Input fields */
 	unsigned int		flags;		/* AHCI_HFLAG_* */
-	u32			mask_port_map;	/* mask out particular bits */
+	u32			mask_port_map;	/* Mask of valid ports */
 
 	void __iomem *		mmio;		/* bus-independent mem map */
 	u32			cap;		/* cap to use */
@@ -379,6 +381,21 @@ struct ahci_host_priv {
 						  int port);
 };
 
+/*
+ * Return true if a port should be ignored because it is excluded from
+ * the host port map.
+ */
+static inline bool ahci_ignore_port(struct ahci_host_priv *hpriv,
+				    unsigned int portid)
+{
+	if (portid >= hpriv->nports)
+		return true;
+	/* mask_port_map not set means that all ports are available */
+	if (!hpriv->mask_port_map)
+		return false;
+	return !(hpriv->mask_port_map & (1 << portid));
+}
+
 extern int ahci_ignore_sss;
 
 extern const struct attribute_group *ahci_shost_groups[];
@@ -396,8 +413,8 @@ extern const struct attribute_group *ahci_sdev_groups[];
 	.shost_groups		= ahci_shost_groups,			\
 	.sdev_groups		= ahci_sdev_groups,			\
 	.change_queue_depth     = ata_scsi_change_queue_depth,		\
-	.tag_alloc_policy       = BLK_TAG_ALLOC_RR,             	\
-	.device_configure	= ata_scsi_device_configure
+	.tag_alloc_policy_rr	= true,					\
+	.sdev_configure		= ata_scsi_sdev_configure
 
 extern struct ata_port_operations ahci_ops;
 extern struct ata_port_operations ahci_platform_ops;
@@ -452,5 +469,33 @@ static inline int ahci_nr_ports(u32 cap)
 {
 	return (cap & 0x1f) + 1;
 }
+
+#ifdef CONFIG_X86_PS4
+struct f_resource{
+	u64 resource_i_ptr;
+	u64 r_bustag;
+	void __iomem * r_bushandle;
+};
+
+struct ahci_controller{
+	void *dev;
+	int dev_id;
+	struct f_resource *r_mem;
+	u32 trace_len;
+};
+
+void bpcie_sata_phy_init(struct device *dev, struct ahci_controller *ctlr);
+
+static inline void bpcie_ahci_write(struct f_resource *r_mem, u32 offset, u32 val) {
+	iowrite32(val, r_mem->r_bushandle + offset);
+}
+
+static inline u32 bpcie_ahci_read(struct f_resource *r_mem, u32 offset) {
+		return ioread32(r_mem->r_bushandle + offset);
+}
+#endif
+
+
+
 
 #endif /* _AHCI_H */

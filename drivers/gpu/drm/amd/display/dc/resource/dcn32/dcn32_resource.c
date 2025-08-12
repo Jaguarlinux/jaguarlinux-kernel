@@ -1749,7 +1749,8 @@ static bool dml1_validate(struct dc *dc, struct dc_state *context, bool fast_val
 
 	int vlevel = 0;
 	int pipe_cnt = 0;
-	display_e2e_pipe_params_st *pipes = kzalloc(dc->res_pool->pipe_count * sizeof(display_e2e_pipe_params_st), GFP_KERNEL);
+	display_e2e_pipe_params_st *pipes = kcalloc(dc->res_pool->pipe_count,
+			sizeof(display_e2e_pipe_params_st), GFP_KERNEL);
 
 	/* To handle Freesync properly, setting FreeSync DML parameters
 	 * to its default state for the first stage of validation
@@ -2066,6 +2067,7 @@ static struct resource_funcs dcn32_res_pool_funcs = {
 	.add_phantom_pipes = dcn32_add_phantom_pipes,
 	.build_pipe_pix_clk_params = dcn20_build_pipe_pix_clk_params,
 	.calculate_mall_ways_from_bytes = dcn32_calculate_mall_ways_from_bytes,
+	.get_vstartup_for_pipe = dcn10_get_vstartup_for_pipe
 };
 
 static uint32_t read_pipe_fuses(struct dc_context *ctx)
@@ -2111,8 +2113,6 @@ static bool dcn32_resource_construct(
 #undef REG_STRUCT
 #define REG_STRUCT dccg_regs
 	dccg_regs_init();
-
-	DC_FP_START();
 
 	ctx->dc_bios->regs = &bios_regs;
 
@@ -2189,6 +2189,7 @@ static bool dcn32_resource_construct(
 	dc->caps.dmcub_support = true;
 	dc->caps.seamless_odm = true;
 	dc->caps.max_v_total = (1 << 15) - 1;
+	dc->caps.vtotal_limited_by_fp2 = true;
 
 	/* Color pipeline capabilities */
 	dc->caps.color.dpp.dcn_arch = 1;
@@ -2498,13 +2499,9 @@ static bool dcn32_resource_construct(
 	if (ASICREV_IS_GC_11_0_3(dc->ctx->asic_id.hw_internal_rev) && (dc->config.sdpif_request_limit_words_per_umc == 0))
 		dc->config.sdpif_request_limit_words_per_umc = 16;
 
-	DC_FP_END();
-
 	return true;
 
 create_fail:
-
-	DC_FP_END();
 
 	dcn32_resource_destruct(pool);
 
@@ -2803,6 +2800,7 @@ struct pipe_ctx *dcn32_acquire_free_pipe_as_secondary_opp_head(
 		free_pipe->plane_res.xfm = pool->transforms[free_pipe_idx];
 		free_pipe->plane_res.dpp = pool->dpps[free_pipe_idx];
 		free_pipe->plane_res.mpcc_inst = pool->dpps[free_pipe_idx]->inst;
+		free_pipe->hblank_borrow = otg_master->hblank_borrow;
 		if (free_pipe->stream->timing.flags.DSC == 1) {
 			dcn20_acquire_dsc(free_pipe->stream->ctx->dc,
 					&new_ctx->res_ctx,

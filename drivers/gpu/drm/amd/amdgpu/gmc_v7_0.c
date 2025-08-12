@@ -152,12 +152,15 @@ static int gmc_v7_0_init_microcode(struct amdgpu_device *adev)
 	case CHIP_KAVERI:
 	case CHIP_KABINI:
 	case CHIP_MULLINS:
+	case CHIP_LIVERPOOL:
+	case CHIP_GLADIUS:
 		return 0;
 	default:
 		return -EINVAL;
 	}
 
-	err = amdgpu_ucode_request(adev, &adev->gmc.fw, "amdgpu/%s_mc.bin", chip_name);
+	err = amdgpu_ucode_request(adev, &adev->gmc.fw, AMDGPU_UCODE_REQUIRED,
+				   "amdgpu/%s_mc.bin", chip_name);
 	if (err) {
 		pr_err("cik_mc: Failed to load firmware \"%s_mc.bin\"\n", chip_name);
 		amdgpu_ucode_release(&adev->gmc.fw);
@@ -400,6 +403,10 @@ static int gmc_v7_0_mc_init(struct amdgpu_device *adev)
 			adev->gmc.gart_size = 256ULL << 20;
 			break;
 #ifdef CONFIG_DRM_AMDGPU_CIK
+		case CHIP_LIVERPOOL:
+		case CHIP_GLADIUS:
+			adev->gmc.gart_size = 512ULL << 20;
+			break;
 		case CHIP_BONAIRE: /* UVD, VCE do not support GPUVM */
 		case CHIP_HAWAII:  /* UVD, VCE do not support GPUVM */
 		case CHIP_KAVERI:  /* UVD, VCE do not support GPUVM */
@@ -678,6 +685,19 @@ static int gmc_v7_0_gart_enable(struct amdgpu_device *adev)
 		else
 			WREG32(mmVM_CONTEXT8_PAGE_TABLE_BASE_ADDR + i - 8,
 			       table_addr >> 12);
+	}
+
+	if (adev->asic_type == CHIP_LIVERPOOL || adev->asic_type == CHIP_GLADIUS) {
+		for (i = 2; i < 8; i++) {
+			WREG32(mmVM_CONTEXT0_PAGE_TABLE_START_ADDR + i, 0);
+			WREG32(mmVM_CONTEXT0_PAGE_TABLE_END_ADDR + i,
+			       adev->vm_manager.max_pfn - 1);
+		}
+		for (i = 0; i < 8; i++) {
+			WREG32(mmVM_CONTEXT8_PAGE_TABLE_START_ADDR + i, 0);
+			WREG32(mmVM_CONTEXT8_PAGE_TABLE_END_ADDR + i,
+			       adev->vm_manager.max_pfn - 1);
+		}
 	}
 
 	/* enable context1-15 */
@@ -1042,6 +1062,10 @@ static int gmc_v7_0_sw_init(struct amdgpu_ip_block *ip_block)
 	if (r)
 		return r;
 
+
+	dev_info(adev->dev, "Done gart\n");
+
+
 	/*
 	 * number of VMs
 	 * VMID 0 is reserved for System
@@ -1066,6 +1090,8 @@ static int gmc_v7_0_sw_init(struct amdgpu_ip_block *ip_block)
 	if (!adev->gmc.vm_fault_info)
 		return -ENOMEM;
 	atomic_set(&adev->gmc.vm_fault_info_updated, 0);
+
+	dev_info(adev->dev, "Done init\n");
 
 	return 0;
 }
@@ -1141,9 +1167,9 @@ static int gmc_v7_0_resume(struct amdgpu_ip_block *ip_block)
 	return 0;
 }
 
-static bool gmc_v7_0_is_idle(void *handle)
+static bool gmc_v7_0_is_idle(struct amdgpu_ip_block *ip_block)
 {
-	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+	struct amdgpu_device *adev = ip_block->adev;
 	u32 tmp = RREG32(mmSRBM_STATUS);
 
 	if (tmp & (SRBM_STATUS__MCB_BUSY_MASK | SRBM_STATUS__MCB_NON_DISPLAY_BUSY_MASK |
@@ -1317,11 +1343,11 @@ static int gmc_v7_0_process_interrupt(struct amdgpu_device *adev,
 	return 0;
 }
 
-static int gmc_v7_0_set_clockgating_state(void *handle,
+static int gmc_v7_0_set_clockgating_state(struct amdgpu_ip_block *ip_block,
 					  enum amd_clockgating_state state)
 {
 	bool gate = false;
-	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+	struct amdgpu_device *adev = ip_block->adev;
 
 	if (state == AMD_CG_STATE_GATE)
 		gate = true;
@@ -1337,7 +1363,7 @@ static int gmc_v7_0_set_clockgating_state(void *handle,
 	return 0;
 }
 
-static int gmc_v7_0_set_powergating_state(void *handle,
+static int gmc_v7_0_set_powergating_state(struct amdgpu_ip_block *ip_block,
 					  enum amd_powergating_state state)
 {
 	return 0;

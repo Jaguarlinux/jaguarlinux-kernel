@@ -30,6 +30,7 @@
 #include <linux/hw_breakpoint.h>
 #include <linux/entry-common.h>
 #include <asm/cpu.h>
+#include <asm/cpuid.h>
 #include <asm/apic.h>
 #include <linux/uaccess.h>
 #include <asm/mwait.h>
@@ -92,7 +93,12 @@ EXPORT_PER_CPU_SYMBOL_GPL(__tss_limit_invalid);
  */
 int arch_dup_task_struct(struct task_struct *dst, struct task_struct *src)
 {
-	memcpy(dst, src, arch_task_struct_size);
+	/* init_task is not dynamically sized (incomplete FPU state) */
+	if (unlikely(src == &init_task))
+		memcpy_and_pad(dst, arch_task_struct_size, src, sizeof(init_task), 0);
+	else
+		memcpy(dst, src, arch_task_struct_size);
+
 #ifdef CONFIG_VM86
 	dst->thread.vm86 = NULL;
 #endif
@@ -175,6 +181,7 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
 	frame->ret_addr = (unsigned long) ret_from_fork_asm;
 	p->thread.sp = (unsigned long) fork_frame;
 	p->thread.io_bitmap = NULL;
+	clear_tsk_thread_flag(p, TIF_IO_BITMAP);
 	p->thread.iopl_warn = 0;
 	memset(p->thread.ptrace_bps, 0, sizeof(p->thread.ptrace_bps));
 
@@ -462,6 +469,11 @@ void native_tss_update_io_bitmap(void)
 		*base = IO_BITMAP_OFFSET_VALID_ALL;
 	} else {
 		struct io_bitmap *iobm = t->io_bitmap;
+
+		if (WARN_ON_ONCE(!iobm)) {
+			clear_thread_flag(TIF_IO_BITMAP);
+			native_tss_invalidate_io_bitmap();
+		}
 
 		/*
 		 * Only copy bitmap data when the sequence number differs. The
@@ -825,7 +837,7 @@ void __noreturn stop_this_cpu(void *dummy)
 	 * X86_FEATURE_SME due to cmdline options.
 	 */
 	if (c->extended_cpuid_level >= 0x8000001f && (cpuid_eax(0x8000001f) & BIT(0)))
-		native_wbinvd();
+		wbinvd();
 
 	/*
 	 * This brings a cache line back and dirties it, but
@@ -838,7 +850,7 @@ void __noreturn stop_this_cpu(void *dummy)
 #ifdef CONFIG_SMP
 	if (smp_ops.stop_this_cpu) {
 		smp_ops.stop_this_cpu();
-		unreachable();
+		BUG();
 	}
 #endif
 
@@ -846,7 +858,7 @@ void __noreturn stop_this_cpu(void *dummy)
 		/*
 		 * Use native_halt() so that memory contents don't change
 		 * (stack usage and variables) after possibly issuing the
-		 * native_wbinvd() above.
+		 * wbinvd() above.
 		 */
 		native_halt();
 	}
@@ -877,7 +889,7 @@ static __init bool prefer_mwait_c1_over_halt(void)
 	if (boot_cpu_has_bug(X86_BUG_MONITOR) || boot_cpu_has_bug(X86_BUG_AMD_APIC_C1E))
 		return false;
 
-	cpuid(CPUID_MWAIT_LEAF, &eax, &ebx, &ecx, &edx);
+	cpuid(CPUID_LEAF_MWAIT, &eax, &ebx, &ecx, &edx);
 
 	/*
 	 * If MWAIT extensions are not available, it is safe to use MWAIT
@@ -901,13 +913,10 @@ static __init bool prefer_mwait_c1_over_halt(void)
 static __cpuidle void mwait_idle(void)
 {
 	if (!current_set_polling_and_test()) {
-		if (this_cpu_has(X86_BUG_CLFLUSH_MONITOR)) {
-			mb(); /* quirk */
-			clflush((void *)&current_thread_info()->flags);
-			mb(); /* quirk */
-		}
+		const void *addr = &current_thread_info()->flags;
 
-		__monitor((void *)&current_thread_info()->flags, 0, 0);
+		alternative_input("", "clflush (%[addr])", X86_BUG_CLFLUSH_MONITOR, [addr] "a" (addr));
+		__monitor(addr, 0, 0);
 		if (!need_resched()) {
 			__sti_mwait(0, 0);
 			raw_local_irq_disable();
@@ -933,7 +942,7 @@ void __init select_idle_routine(void)
 		static_call_update(x86_idle, mwait_idle);
 	} else if (cpu_feature_enabled(X86_FEATURE_TDX_GUEST)) {
 		pr_info("using TDX aware idle routine\n");
-		static_call_update(x86_idle, tdx_safe_halt);
+		static_call_update(x86_idle, tdx_halt);
 	} else {
 		static_call_update(x86_idle, default_idle);
 	}
@@ -1042,7 +1051,7 @@ unsigned long __get_wchan(struct task_struct *p)
 	return addr;
 }
 
-long do_arch_prctl_common(int option, unsigned long arg2)
+SYSCALL_DEFINE2(arch_prctl, int, option, unsigned long, arg2)
 {
 	switch (option) {
 	case ARCH_GET_CPUID:
@@ -1057,5 +1066,13 @@ long do_arch_prctl_common(int option, unsigned long arg2)
 		return fpu_xstate_prctl(option, arg2);
 	}
 
+	if (!in_ia32_syscall())
+		return do_arch_prctl_64(current, option, arg2);
+
 	return -EINVAL;
+}
+
+SYSCALL_DEFINE0(ni_syscall)
+{
+	return -ENOSYS;
 }

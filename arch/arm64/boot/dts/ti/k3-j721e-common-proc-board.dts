@@ -540,6 +540,7 @@
 		#phy-cells = <0>;
 		cdns,phy-type = <PHY_TYPE_USB3>;
 		resets = <&serdes_wiz3 1>, <&serdes_wiz3 2>;
+		bootph-all;
 	};
 };
 
@@ -572,6 +573,7 @@
 &ospi1 {
 	pinctrl-names = "default";
 	pinctrl-0 = <&mcu_fss0_ospi1_pins_default>;
+	status = "okay";
 
 	flash@0 {
 		compatible = "jedec,spi-nor";

@@ -706,7 +706,7 @@ void ieee80211_mesh_root_setup(struct ieee80211_if_mesh *ifmsh)
 	else {
 		clear_bit(MESH_WORK_ROOT, &ifmsh->wrkq_flags);
 		/* stop running timer */
-		del_timer_sync(&ifmsh->mesh_path_root_timer);
+		timer_delete_sync(&ifmsh->mesh_path_root_timer);
 	}
 }
 
@@ -1157,14 +1157,14 @@ void ieee80211_mbss_info_change_notify(struct ieee80211_sub_if_data *sdata,
 				       u64 changed)
 {
 	struct ieee80211_if_mesh *ifmsh = &sdata->u.mesh;
-	unsigned long bits = changed;
+	unsigned long bits[] = { BITMAP_FROM_U64(changed) };
 	u32 bit;
 
-	if (!bits)
+	if (!changed)
 		return;
 
 	/* if we race with running work, worst case this work becomes a noop */
-	for_each_set_bit(bit, &bits, sizeof(changed) * BITS_PER_BYTE)
+	for_each_set_bit(bit, bits, sizeof(changed) * BITS_PER_BYTE)
 		set_bit(bit, ifmsh->mbss_changed);
 	set_bit(MESH_WORK_MBSS_CHANGED, &ifmsh->wrkq_flags);
 	wiphy_work_queue(sdata->local->hw.wiphy, &sdata->work);
@@ -1241,9 +1241,9 @@ void ieee80211_stop_mesh(struct ieee80211_sub_if_data *sdata)
 	local->total_ps_buffered -= skb_queue_len(&ifmsh->ps.bc_buf);
 	skb_queue_purge(&ifmsh->ps.bc_buf);
 
-	del_timer_sync(&sdata->u.mesh.housekeeping_timer);
-	del_timer_sync(&sdata->u.mesh.mesh_path_root_timer);
-	del_timer_sync(&sdata->u.mesh.mesh_path_timer);
+	timer_delete_sync(&sdata->u.mesh.housekeeping_timer);
+	timer_delete_sync(&sdata->u.mesh.mesh_path_root_timer);
+	timer_delete_sync(&sdata->u.mesh.mesh_path_timer);
 
 	/* clear any mesh work (for next join) we may have accrued */
 	ifmsh->wrkq_flags = 0;

@@ -420,6 +420,8 @@ static int dce_v8_0_get_num_crtc(struct amdgpu_device *adev)
 	switch (adev->asic_type) {
 	case CHIP_BONAIRE:
 	case CHIP_HAWAII:
+	case CHIP_GLADIUS:
+	case CHIP_LIVERPOOL:
 		num_crtc = 6;
 		break;
 	case CHIP_KAVERI:
@@ -1116,6 +1118,12 @@ static void dce_v8_0_bandwidth_update(struct amdgpu_device *adev)
 	u32 num_heads = 0, lb_size;
 	int i;
 
+	if((adev->asic_type == CHIP_LIVERPOOL) ||
+	   (adev->asic_type == CHIP_GLADIUS)) {
+		// FIXME PS4 (ps4patches): this stuff is broken
+		return;
+	}
+
 	amdgpu_display_update_priority(adev);
 
 	for (i = 0; i < adev->mode_info.num_crtc; i++) {
@@ -1395,13 +1403,13 @@ static void dce_v8_0_audio_enable(struct amdgpu_device *adev,
 }
 
 static const u32 pin_offsets[7] = {
-	(0x1780 - 0x1780),
-	(0x1786 - 0x1780),
-	(0x178c - 0x1780),
-	(0x1792 - 0x1780),
-	(0x1798 - 0x1780),
-	(0x179d - 0x1780),
-	(0x17a4 - 0x1780),
+	AUD0_REGISTER_OFFSET,
+	AUD1_REGISTER_OFFSET,
+	AUD2_REGISTER_OFFSET,
+	AUD3_REGISTER_OFFSET,
+	AUD4_REGISTER_OFFSET,
+	AUD5_REGISTER_OFFSET,
+	AUD6_REGISTER_OFFSET,
 };
 
 static int dce_v8_0_audio_init(struct amdgpu_device *adev)
@@ -1422,6 +1430,7 @@ static int dce_v8_0_audio_init(struct amdgpu_device *adev)
 		 (adev->asic_type == CHIP_HAWAII))/* BN/HW: 6 streams, 7 endpoints */
 		adev->mode_info.audio.num_pins = 7;
 	else
+		/* (ps4patches) - Liverpool and Gladius use 3 streams so that is fine here */
 		adev->mode_info.audio.num_pins = 3;
 
 	for (i = 0; i < adev->mode_info.audio.num_pins; i++) {
@@ -1435,7 +1444,11 @@ static int dce_v8_0_audio_init(struct amdgpu_device *adev)
 		adev->mode_info.audio.pin[i].id = i;
 		/* disable audio.  it will be set up later */
 		/* XXX remove once we switch to ip funcs */
-		dce_v8_0_audio_enable(adev, &adev->mode_info.audio.pin[i], false);
+		/* Liverpool pin 2 is S/PDIF and should always be available */
+		if (adev->asic_type == CHIP_LIVERPOOL || adev->asic_type == CHIP_GLADIUS)
+			dce_v8_0_audio_enable(adev, &adev->mode_info.audio.pin[i], true);
+		else
+			dce_v8_0_audio_enable(adev, &adev->mode_info.audio.pin[i], false);
 	}
 
 	return 0;
@@ -2011,7 +2024,9 @@ static int dce_v8_0_crtc_do_set_base(struct drm_crtc *crtc,
 	}
 
 	/* Bytes per pixel may have changed */
-	dce_v8_0_bandwidth_update(adev);
+	if ((adev->asic_type != CHIP_LIVERPOOL) &&
+	    (adev->asic_type != CHIP_GLADIUS))
+		dce_v8_0_bandwidth_update(adev);
 
 	return 0;
 }
@@ -2613,6 +2628,31 @@ static const struct drm_crtc_helper_funcs dce_v8_0_crtc_helper_funcs = {
 	.get_scanout_position = amdgpu_crtc_get_scanout_position,
 };
 
+static void dce_v8_0_panic_flush(struct drm_plane *plane)
+{
+	struct drm_framebuffer *fb;
+	struct amdgpu_crtc *amdgpu_crtc;
+	struct amdgpu_device *adev;
+	uint32_t fb_format;
+
+	if (!plane->fb)
+		return;
+
+	fb = plane->fb;
+	amdgpu_crtc = to_amdgpu_crtc(plane->crtc);
+	adev = drm_to_adev(fb->dev);
+
+	/* Disable DC tiling */
+	fb_format = RREG32(mmGRPH_CONTROL + amdgpu_crtc->crtc_offset);
+	fb_format &= ~GRPH_CONTROL__GRPH_ARRAY_MODE_MASK;
+	WREG32(mmGRPH_CONTROL + amdgpu_crtc->crtc_offset, fb_format);
+}
+
+static const struct drm_plane_helper_funcs dce_v8_0_drm_primary_plane_helper_funcs = {
+	.get_scanout_buffer = amdgpu_display_get_scanout_buffer,
+	.panic_flush = dce_v8_0_panic_flush,
+};
+
 static int dce_v8_0_crtc_init(struct amdgpu_device *adev, int index)
 {
 	struct amdgpu_crtc *amdgpu_crtc;
@@ -2628,10 +2668,18 @@ static int dce_v8_0_crtc_init(struct amdgpu_device *adev, int index)
 	amdgpu_crtc->crtc_id = index;
 	adev->mode_info.crtcs[index] = amdgpu_crtc;
 
-	amdgpu_crtc->max_cursor_width = CIK_CURSOR_WIDTH;
-	amdgpu_crtc->max_cursor_height = CIK_CURSOR_HEIGHT;
-	adev_to_drm(adev)->mode_config.cursor_width = amdgpu_crtc->max_cursor_width;
-	adev_to_drm(adev)->mode_config.cursor_height = amdgpu_crtc->max_cursor_height;
+	if ((adev->asic_type == CHIP_LIVERPOOL) || (adev->asic_type == CHIP_GLADIUS)) {
+		amdgpu_crtc->max_cursor_width = LVP_CURSOR_WIDTH;
+		amdgpu_crtc->max_cursor_height = LVP_CURSOR_HEIGHT;
+		adev_to_drm(adev)->mode_config.cursor_width = amdgpu_crtc->max_cursor_width;
+		adev_to_drm(adev)->mode_config.cursor_height = amdgpu_crtc->max_cursor_height;
+	}
+	else {
+		amdgpu_crtc->max_cursor_width = CIK_CURSOR_WIDTH;
+		amdgpu_crtc->max_cursor_height = CIK_CURSOR_HEIGHT;
+		adev_to_drm(adev)->mode_config.cursor_width = amdgpu_crtc->max_cursor_width;
+		adev_to_drm(adev)->mode_config.cursor_height = amdgpu_crtc->max_cursor_height;
+	}
 
 	amdgpu_crtc->crtc_offset = crtc_offsets[amdgpu_crtc->crtc_id];
 
@@ -2640,6 +2688,7 @@ static int dce_v8_0_crtc_init(struct amdgpu_device *adev, int index)
 	amdgpu_crtc->encoder = NULL;
 	amdgpu_crtc->connector = NULL;
 	drm_crtc_helper_add(&amdgpu_crtc->base, &dce_v8_0_crtc_helper_funcs);
+	drm_plane_helper_add(amdgpu_crtc->base.primary, &dce_v8_0_drm_primary_plane_helper_funcs);
 
 	return 0;
 }
@@ -2658,10 +2707,12 @@ static int dce_v8_0_early_init(struct amdgpu_ip_block *ip_block)
 	switch (adev->asic_type) {
 	case CHIP_BONAIRE:
 	case CHIP_HAWAII:
+	case CHIP_GLADIUS:
 		adev->mode_info.num_hpd = 6;
 		adev->mode_info.num_dig = 6;
 		break;
 	case CHIP_KAVERI:
+	case CHIP_LIVERPOOL:
 		adev->mode_info.num_hpd = 6;
 		adev->mode_info.num_dig = 7;
 		break;
@@ -2797,7 +2848,12 @@ static int dce_v8_0_hw_init(struct amdgpu_ip_block *ip_block)
 	dce_v8_0_hpd_init(adev);
 
 	for (i = 0; i < adev->mode_info.audio.num_pins; i++) {
-		dce_v8_0_audio_enable(adev, &adev->mode_info.audio.pin[i], false);
+		// TODO (ps4patches): In original patches original disable was still here
+		// Maybe that is still needed
+		if (adev->asic_type == CHIP_LIVERPOOL || adev->asic_type == CHIP_GLADIUS)
+			dce_v8_0_audio_enable(adev, &adev->mode_info.audio.pin[i], true);
+		else
+			dce_v8_0_audio_enable(adev, &adev->mode_info.audio.pin[i], false);
 	}
 
 	dce_v8_0_pageflip_interrupt_init(adev);
@@ -2861,7 +2917,7 @@ static int dce_v8_0_resume(struct amdgpu_ip_block *ip_block)
 	return amdgpu_display_resume_helper(adev);
 }
 
-static bool dce_v8_0_is_idle(void *handle)
+static bool dce_v8_0_is_idle(struct amdgpu_ip_block *ip_block)
 {
 	return true;
 }
@@ -3212,13 +3268,13 @@ static int dce_v8_0_hpd_irq(struct amdgpu_device *adev,
 
 }
 
-static int dce_v8_0_set_clockgating_state(void *handle,
+static int dce_v8_0_set_clockgating_state(struct amdgpu_ip_block *ip_block,
 					  enum amd_clockgating_state state)
 {
 	return 0;
 }
 
-static int dce_v8_0_set_powergating_state(void *handle,
+static int dce_v8_0_set_powergating_state(struct amdgpu_ip_block *ip_block,
 					  enum amd_powergating_state state)
 {
 	return 0;

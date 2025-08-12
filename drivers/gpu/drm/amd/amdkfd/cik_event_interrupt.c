@@ -38,12 +38,13 @@ static bool cik_event_interrupt_isr(struct kfd_node *dev,
 	uint16_t pasid;
 	bool ret;
 
-	/* This workaround is due to HW/FW limitation on Hawaii that
+	/* This workaround is due to HW/FW limitation on Hawaii and Liverpool that
 	 * VMID and PASID are not written into ih_ring_entry
 	 */
 	if ((ihre->source_id == CIK_INTSRC_GFX_PAGE_INV_FAULT ||
 		ihre->source_id == CIK_INTSRC_GFX_MEM_PROT_FAULT) &&
-		dev->adev->asic_type == CHIP_HAWAII) {
+		((dev->adev->asic_type == CHIP_HAWAII) || 
+		 (dev->adev->asic_type == CHIP_LIVERPOOL)) {
 		struct cik_ih_ring_entry *tmp_ihre =
 			(struct cik_ih_ring_entry *)patched_ihre;
 
@@ -107,20 +108,30 @@ static void cik_event_interrupt_wq(struct kfd_node *dev,
 		kfd_signal_hw_exception_event(pasid);
 	else if (ihre->source_id == CIK_INTSRC_GFX_PAGE_INV_FAULT ||
 		ihre->source_id == CIK_INTSRC_GFX_MEM_PROT_FAULT) {
+		struct kfd_process_device *pdd = NULL;
 		struct kfd_vm_fault_info info;
+		struct kfd_process *p;
 
 		kfd_smi_event_update_vmfault(dev, pasid);
-		kfd_dqm_evict_pasid(dev->dqm, pasid);
+		p = kfd_lookup_process_by_pasid(pasid, &pdd);
+		if (!pdd)
+			return;
+
+		kfd_evict_process_device(pdd);
 
 		memset(&info, 0, sizeof(info));
 		amdgpu_amdkfd_gpuvm_get_vm_fault_info(dev->adev, &info);
-		if (!info.page_addr && !info.status)
+		if (!info.page_addr && !info.status) {
+			kfd_unref_process(p);
 			return;
+		}
 
 		if (info.vmid == vmid)
-			kfd_signal_vm_fault_event(dev, pasid, &info, NULL);
+			kfd_signal_vm_fault_event(pdd, &info, NULL);
 		else
-			kfd_signal_vm_fault_event(dev, pasid, NULL, NULL);
+			kfd_signal_vm_fault_event(pdd, &info, NULL);
+
+		kfd_unref_process(p);
 	}
 }
 

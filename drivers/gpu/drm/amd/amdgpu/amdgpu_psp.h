@@ -80,6 +80,7 @@ enum psp_bootloader_cmd {
 	PSP_BL__DRAM_LONG_TRAIN		= 0x100000,
 	PSP_BL__DRAM_SHORT_TRAIN	= 0x200000,
 	PSP_BL__LOAD_TOS_SPL_TABLE	= 0x10000000,
+	PSP_BL__LOAD_SPDMDRV		= 0x20000000,
 };
 
 enum psp_ring_type {
@@ -106,6 +107,7 @@ enum psp_reg_prog_id {
 	PSP_REG_IH_RB_CNTL        = 0,  /* register IH_RB_CNTL */
 	PSP_REG_IH_RB_CNTL_RING1  = 1,  /* register IH_RB_CNTL_RING1 */
 	PSP_REG_IH_RB_CNTL_RING2  = 2,  /* register IH_RB_CNTL_RING2 */
+	PSP_REG_MMHUB_L1_TLB_CNTL = 25,
 	PSP_REG_LAST
 };
 
@@ -120,6 +122,7 @@ struct psp_funcs {
 	int (*bootloader_load_dbg_drv)(struct psp_context *psp);
 	int (*bootloader_load_ras_drv)(struct psp_context *psp);
 	int (*bootloader_load_ipkeymgr_drv)(struct psp_context *psp);
+	int (*bootloader_load_spdm_drv)(struct psp_context *psp);
 	int (*bootloader_load_sos)(struct psp_context *psp);
 	int (*ring_create)(struct psp_context *psp,
 			   enum psp_ring_type ring_type);
@@ -140,6 +143,8 @@ struct psp_funcs {
 	bool (*get_ras_capability)(struct psp_context *psp);
 	bool (*is_aux_sos_load_required)(struct psp_context *psp);
 	bool (*is_reload_needed)(struct psp_context *psp);
+	int (*reg_program_no_ring)(struct psp_context *psp, uint32_t val,
+				   enum psp_reg_prog_id id);
 };
 
 struct ta_funcs {
@@ -343,6 +348,7 @@ struct psp_context {
 	struct psp_bin_desc		dbg_drv;
 	struct psp_bin_desc		ras_drv;
 	struct psp_bin_desc		ipkeymgr_drv;
+	struct psp_bin_desc		spdm_drv;
 
 	/* tmr buffer */
 	struct amdgpu_bo		*tmr_bo;
@@ -434,6 +440,9 @@ struct amdgpu_psp_funcs {
 #define psp_bootloader_load_ipkeymgr_drv(psp) \
 		((psp)->funcs->bootloader_load_ipkeymgr_drv ? \
 		 (psp)->funcs->bootloader_load_ipkeymgr_drv((psp)) : 0)
+#define psp_bootloader_load_spdm_drv(psp) \
+		((psp)->funcs->bootloader_load_spdm_drv ? \
+		 (psp)->funcs->bootloader_load_spdm_drv((psp)) : 0)
 #define psp_bootloader_load_sos(psp) \
 		((psp)->funcs->bootloader_load_sos ? (psp)->funcs->bootloader_load_sos((psp)) : 0)
 #define psp_smu_reload_quirk(psp) \
@@ -468,6 +477,10 @@ struct amdgpu_psp_funcs {
 
 #define psp_is_aux_sos_load_required(psp) \
 	((psp)->funcs->is_aux_sos_load_required ? (psp)->funcs->is_aux_sos_load_required((psp)) : 0)
+
+#define psp_reg_program_no_ring(psp, val, id) \
+	((psp)->funcs->reg_program_no_ring ? \
+	(psp)->funcs->reg_program_no_ring((psp), val, id) : -EINVAL)
 
 extern const struct amd_ip_funcs psp_ip_funcs;
 
@@ -563,5 +576,8 @@ bool amdgpu_psp_get_ras_capability(struct psp_context *psp);
 int psp_config_sq_perfmon(struct psp_context *psp, uint32_t xcp_id,
 	bool core_override_enable, bool reg_override_enable, bool perfmon_override_enable);
 bool amdgpu_psp_tos_reload_needed(struct amdgpu_device *adev);
+int amdgpu_psp_reg_program_no_ring(struct psp_context *psp, uint32_t val,
+				   enum psp_reg_prog_id id);
+
 
 #endif

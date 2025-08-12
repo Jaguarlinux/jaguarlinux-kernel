@@ -679,22 +679,6 @@ void rvin_crop_scale_comp(struct rvin_dev *vin)
 
 	fmt = rvin_format_from_pixel(vin, vin->format.pixelformat);
 	stride = vin->format.bytesperline / fmt->bpp;
-
-	/* For RAW8 format bpp is 1, but the hardware process RAW8
-	 * format in 2 pixel unit hence configure VNIS_REG as stride / 2.
-	 */
-	switch (vin->format.pixelformat) {
-	case V4L2_PIX_FMT_SBGGR8:
-	case V4L2_PIX_FMT_SGBRG8:
-	case V4L2_PIX_FMT_SGRBG8:
-	case V4L2_PIX_FMT_SRGGB8:
-	case V4L2_PIX_FMT_GREY:
-		stride /= 2;
-		break;
-	default:
-		break;
-	}
-
 	rvin_write(vin, stride, VNIS_REG);
 }
 
@@ -910,7 +894,7 @@ static int rvin_setup(struct rvin_dev *vin)
 	case V4L2_PIX_FMT_SGBRG10:
 	case V4L2_PIX_FMT_SGRBG10:
 	case V4L2_PIX_FMT_SRGGB10:
-		dmr = VNDMR_RMODE_RAW10 | VNDMR_YC_THR;
+		dmr = VNDMR_RMODE_RAW10;
 		break;
 	default:
 		vin_err(vin, "Invalid pixelformat (0x%x)\n",
@@ -1397,7 +1381,7 @@ static int rvin_set_stream(struct rvin_dev *vin, int on)
 
 	if (!on) {
 		video_device_pipeline_stop(&vin->vdev);
-		return v4l2_subdev_call(sd, video, s_stream, 0);
+		return v4l2_subdev_disable_streams(sd, pad->index, BIT_ULL(0));
 	}
 
 	ret = rvin_mc_validate_format(vin, sd, pad);
@@ -1408,7 +1392,7 @@ static int rvin_set_stream(struct rvin_dev *vin, int on)
 	if (ret)
 		return ret;
 
-	ret = v4l2_subdev_call(sd, video, s_stream, 1);
+	ret = v4l2_subdev_enable_streams(sd, pad->index, BIT_ULL(0));
 	if (ret == -ENOIOCTLCMD)
 		ret = 0;
 	if (ret)

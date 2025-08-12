@@ -75,6 +75,7 @@ int radeon_vce_init(struct radeon_device *rdev)
 	case CHIP_BONAIRE:
 	case CHIP_KAVERI:
 	case CHIP_KABINI:
+	case CHIP_LIVERPOOL:
 	case CHIP_HAWAII:
 	case CHIP_MULLINS:
 		fw_name = FIRMWARE_BONAIRE;
@@ -557,7 +558,7 @@ int radeon_vce_cs_parse(struct radeon_cs_parser *p)
 {
 	int session_idx = -1;
 	bool destroyed = false, created = false, allocated = false;
-	uint32_t tmp, handle = 0;
+	uint32_t tmp = 0, handle = 0;
 	uint32_t *size = &tmp;
 	int i, r = 0;
 

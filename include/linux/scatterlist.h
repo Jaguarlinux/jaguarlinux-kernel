@@ -313,7 +313,7 @@ static inline void sg_dma_mark_bus_address(struct scatterlist *sg)
 }
 
 /**
- * sg_unmark_bus_address - Unmark the scatterlist entry as a bus address
+ * sg_dma_unmark_bus_address - Unmark the scatterlist entry as a bus address
  * @sg:		 SG entry
  *
  * Description:
@@ -671,6 +671,7 @@ sg_page_iter_dma_address(struct sg_dma_page_iter *dma_iter)
 #define SG_MITER_ATOMIC		(1 << 0)	 /* use kmap_atomic */
 #define SG_MITER_TO_SG		(1 << 1)	/* flush back to phys on unmap */
 #define SG_MITER_FROM_SG	(1 << 2)	/* nop */
+#define SG_MITER_LOCAL		(1 << 3)	 /* use kmap_local */
 
 struct sg_mapping_iter {
 	/* the following three fields can be accessed directly */

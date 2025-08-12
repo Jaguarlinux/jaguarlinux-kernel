@@ -359,9 +359,6 @@ static void task_fpsimd_load(void)
 	WARN_ON(preemptible());
 	WARN_ON(test_thread_flag(TIF_KERNEL_FPSTATE));
 
-	if (system_supports_fpmr())
-		write_sysreg_s(current->thread.uw.fpmr, SYS_FPMR);
-
 	if (system_supports_sve() || system_supports_sme()) {
 		switch (current->thread.fp_type) {
 		case FP_STATE_FPSIMD:
@@ -412,6 +409,9 @@ static void task_fpsimd_load(void)
 		if (thread_sm_enabled(&current->thread))
 			restore_ffr = system_supports_fa64();
 	}
+
+	if (system_supports_fpmr())
+		write_sysreg_s(current->thread.uw.fpmr, SYS_FPMR);
 
 	if (restore_sve_regs) {
 		WARN_ON_ONCE(current->thread.fp_type != FP_STATE_SVE);
@@ -562,7 +562,7 @@ static int vec_proc_do_default_vl(const struct ctl_table *table, int write,
 	return 0;
 }
 
-static struct ctl_table sve_default_vl_table[] = {
+static const struct ctl_table sve_default_vl_table[] = {
 	{
 		.procname	= "sve_default_vector_length",
 		.mode		= 0644,
@@ -585,7 +585,7 @@ static int __init sve_sysctl_init(void) { return 0; }
 #endif /* ! (CONFIG_ARM64_SVE && CONFIG_SYSCTL) */
 
 #if defined(CONFIG_ARM64_SME) && defined(CONFIG_SYSCTL)
-static struct ctl_table sme_default_vl_table[] = {
+static const struct ctl_table sme_default_vl_table[] = {
 	{
 		.procname	= "sme_default_vector_length",
 		.mode		= 0644,
@@ -651,7 +651,7 @@ static void __fpsimd_to_sve(void *sst, struct user_fpsimd_state const *fst,
  * task->thread.uw.fpsimd_state must be up to date before calling this
  * function.
  */
-static void fpsimd_to_sve(struct task_struct *task)
+static inline void fpsimd_to_sve(struct task_struct *task)
 {
 	unsigned int vq;
 	void *sst = task->thread.sve_state;
@@ -675,7 +675,7 @@ static void fpsimd_to_sve(struct task_struct *task)
  * bytes of allocated kernel memory.
  * task->thread.sve_state must be up to date before calling this function.
  */
-static void sve_to_fpsimd(struct task_struct *task)
+static inline void sve_to_fpsimd(struct task_struct *task)
 {
 	unsigned int vq, vl;
 	void const *sst = task->thread.sve_state;
@@ -1436,7 +1436,7 @@ void do_sme_acc(unsigned long esr, struct pt_regs *regs)
 	 * If this not a trap due to SME being disabled then something
 	 * is being used in the wrong mode, report as SIGILL.
 	 */
-	if (ESR_ELx_ISS(esr) != ESR_ELx_SME_ISS_SME_DISABLED) {
+	if (ESR_ELx_SME_ISS_SMTC(esr) != ESR_ELx_SME_ISS_SMTC_SME_DISABLED) {
 		force_signal_inject(SIGILL, ILL_ILLOPC, regs->pc, 0);
 		return;
 	}
@@ -1460,6 +1460,8 @@ void do_sme_acc(unsigned long esr, struct pt_regs *regs)
 		sme_set_vq(vq_minus_one);
 
 		fpsimd_bind_task_to_cpu();
+	} else {
+		fpsimd_flush_task_state(current);
 	}
 
 	put_cpu_fpsimd_context();
@@ -1573,8 +1575,8 @@ void fpsimd_thread_switch(struct task_struct *next)
 		fpsimd_save_user_state();
 
 	if (test_tsk_thread_flag(next, TIF_KERNEL_FPSTATE)) {
-		fpsimd_load_kernel_state(next);
 		fpsimd_flush_cpu_state();
+		fpsimd_load_kernel_state(next);
 	} else {
 		/*
 		 * Fix up TIF_FOREIGN_FPSTATE to correctly describe next's
@@ -1661,6 +1663,9 @@ void fpsimd_flush_thread(void)
 		current->thread.svcr = 0;
 	}
 
+	if (system_supports_fpmr())
+		current->thread.uw.fpmr = 0;
+
 	current->thread.fp_type = FP_STATE_FPSIMD;
 
 	put_cpu_fpsimd_context();
@@ -1692,31 +1697,6 @@ void fpsimd_signal_preserve_current_state(void)
 	fpsimd_preserve_current_state();
 	if (current->thread.fp_type == FP_STATE_SVE)
 		sve_to_fpsimd(current);
-}
-
-/*
- * Called by KVM when entering the guest.
- */
-void fpsimd_kvm_prepare(void)
-{
-	if (!system_supports_sve())
-		return;
-
-	/*
-	 * KVM does not save host SVE state since we can only enter
-	 * the guest from a syscall so the ABI means that only the
-	 * non-saved SVE state needs to be saved.  If we have left
-	 * SVE enabled for performance reasons then update the task
-	 * state to be FPSIMD only.
-	 */
-	get_cpu_fpsimd_context();
-
-	if (test_and_clear_thread_flag(TIF_SVE)) {
-		sve_to_fpsimd(current);
-		current->thread.fp_type = FP_STATE_FPSIMD;
-	}
-
-	put_cpu_fpsimd_context();
 }
 
 /*
@@ -1826,7 +1806,7 @@ void fpsimd_update_current_state(struct user_fpsimd_state const *state)
 	get_cpu_fpsimd_context();
 
 	current->thread.uw.fpsimd_state = *state;
-	if (test_thread_flag(TIF_SVE))
+	if (current->thread.fp_type == FP_STATE_SVE)
 		fpsimd_to_sve(current);
 
 	task_fpsimd_load();

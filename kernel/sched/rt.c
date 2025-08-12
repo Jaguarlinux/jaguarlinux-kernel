@@ -26,7 +26,7 @@ static int sched_rt_handler(const struct ctl_table *table, int write, void *buff
 		size_t *lenp, loff_t *ppos);
 static int sched_rr_handler(const struct ctl_table *table, int write, void *buffer,
 		size_t *lenp, loff_t *ppos);
-static struct ctl_table sched_rt_sysctls[] = {
+static const struct ctl_table sched_rt_sysctls[] = {
 	{
 		.procname       = "sched_rt_period_us",
 		.data           = &sysctl_sched_rt_period,
@@ -127,9 +127,8 @@ void init_rt_bandwidth(struct rt_bandwidth *rt_b, u64 period, u64 runtime)
 
 	raw_spin_lock_init(&rt_b->rt_runtime_lock);
 
-	hrtimer_init(&rt_b->rt_period_timer, CLOCK_MONOTONIC,
-		     HRTIMER_MODE_REL_HARD);
-	rt_b->rt_period_timer.function = sched_rt_period_timer;
+	hrtimer_setup(&rt_b->rt_period_timer, sched_rt_period_timer, CLOCK_MONOTONIC,
+		      HRTIMER_MODE_REL_HARD);
 }
 
 static inline void do_start_rt_bandwidth(struct rt_bandwidth *rt_b)
@@ -169,9 +168,8 @@ static void destroy_rt_bandwidth(struct rt_bandwidth *rt_b)
 
 static inline struct task_struct *rt_task_of(struct sched_rt_entity *rt_se)
 {
-#ifdef CONFIG_SCHED_DEBUG
 	WARN_ON_ONCE(!rt_entity_is_task(rt_se));
-#endif
+
 	return container_of(rt_se, struct task_struct, rt);
 }
 
@@ -1713,7 +1711,7 @@ static struct sched_rt_entity *pick_next_rt_entity(struct rt_rq *rt_rq)
 	BUG_ON(idx >= MAX_RT_PRIO);
 
 	queue = array->queue + idx;
-	if (SCHED_WARN_ON(list_empty(queue)))
+	if (WARN_ON_ONCE(list_empty(queue)))
 		return NULL;
 	next = list_entry(queue->next, struct sched_rt_entity, run_list);
 
@@ -1885,6 +1883,27 @@ static int find_lowest_rq(struct task_struct *task)
 	return -1;
 }
 
+static struct task_struct *pick_next_pushable_task(struct rq *rq)
+{
+	struct task_struct *p;
+
+	if (!has_pushable_tasks(rq))
+		return NULL;
+
+	p = plist_first_entry(&rq->rt.pushable_tasks,
+			      struct task_struct, pushable_tasks);
+
+	BUG_ON(rq->cpu != task_cpu(p));
+	BUG_ON(task_current(rq, p));
+	BUG_ON(task_current_donor(rq, p));
+	BUG_ON(p->nr_cpus_allowed <= 1);
+
+	BUG_ON(!task_on_rq_queued(p));
+	BUG_ON(!rt_task(p));
+
+	return p;
+}
+
 /* Will lock the rq it finds */
 static struct rq *find_lock_lowest_rq(struct task_struct *task, struct rq *rq)
 {
@@ -1915,18 +1934,16 @@ static struct rq *find_lock_lowest_rq(struct task_struct *task, struct rq *rq)
 			/*
 			 * We had to unlock the run queue. In
 			 * the mean time, task could have
-			 * migrated already or had its affinity changed.
-			 * Also make sure that it wasn't scheduled on its rq.
+			 * migrated already or had its affinity changed,
+			 * therefore check if the task is still at the
+			 * head of the pushable tasks list.
 			 * It is possible the task was scheduled, set
 			 * "migrate_disabled" and then got preempted, so we must
 			 * check the task migration disable flag here too.
 			 */
-			if (unlikely(task_rq(task) != rq ||
+			if (unlikely(is_migration_disabled(task) ||
 				     !cpumask_test_cpu(lowest_rq->cpu, &task->cpus_mask) ||
-				     task_on_cpu(rq, task) ||
-				     !rt_task(task) ||
-				     is_migration_disabled(task) ||
-				     !task_on_rq_queued(task))) {
+				     task != pick_next_pushable_task(rq))) {
 
 				double_unlock_balance(rq, lowest_rq);
 				lowest_rq = NULL;
@@ -1944,27 +1961,6 @@ static struct rq *find_lock_lowest_rq(struct task_struct *task, struct rq *rq)
 	}
 
 	return lowest_rq;
-}
-
-static struct task_struct *pick_next_pushable_task(struct rq *rq)
-{
-	struct task_struct *p;
-
-	if (!has_pushable_tasks(rq))
-		return NULL;
-
-	p = plist_first_entry(&rq->rt.pushable_tasks,
-			      struct task_struct, pushable_tasks);
-
-	BUG_ON(rq->cpu != task_cpu(p));
-	BUG_ON(task_current(rq, p));
-	BUG_ON(task_current_donor(rq, p));
-	BUG_ON(p->nr_cpus_allowed <= 1);
-
-	BUG_ON(!task_on_rq_queued(p));
-	BUG_ON(!rt_task(p));
-
-	return p;
 }
 
 /*
@@ -2910,6 +2906,7 @@ static int sched_rt_handler(const struct ctl_table *table, int write, void *buff
 	int ret;
 
 	mutex_lock(&mutex);
+	sched_domains_mutex_lock();
 	old_period = sysctl_sched_rt_period;
 	old_runtime = sysctl_sched_rt_runtime;
 
@@ -2936,6 +2933,7 @@ undo:
 		sysctl_sched_rt_period = old_period;
 		sysctl_sched_rt_runtime = old_runtime;
 	}
+	sched_domains_mutex_unlock();
 	mutex_unlock(&mutex);
 
 	return ret;
@@ -2967,7 +2965,6 @@ static int sched_rr_handler(const struct ctl_table *table, int write, void *buff
 }
 #endif /* CONFIG_SYSCTL */
 
-#ifdef CONFIG_SCHED_DEBUG
 void print_rt_stats(struct seq_file *m, int cpu)
 {
 	rt_rq_iter_t iter;
@@ -2978,4 +2975,3 @@ void print_rt_stats(struct seq_file *m, int cpu)
 		print_rt_rq(m, cpu, rt_rq);
 	rcu_read_unlock();
 }
-#endif /* CONFIG_SCHED_DEBUG */

@@ -33,6 +33,10 @@
 #include <linux/io-64-nonatomic-lo-hi.h>
 #include "ahci.h"
 
+#ifdef CONFIG_X86_PS4
+#include <asm/ps4.h>
+#endif
+
 #define DRV_NAME	"ahci"
 #define DRV_VERSION	"3.0"
 
@@ -48,6 +52,7 @@ enum {
 enum board_ids {
 	/* board IDs by feature in alphabetical order */
 	board_ahci,
+	board_ahci_31bit_dma,
 	board_ahci_43bit_dma,
 	board_ahci_ign_iferr,
 	board_ahci_no_debounce_delay,
@@ -63,6 +68,7 @@ enum board_ids {
 	board_ahci_pcs_quirk_no_devslp,
 	board_ahci_pcs_quirk_no_sntf,
 	board_ahci_yes_fbs,
+	board_ahci_yes_fbs_atapi_dma,
 
 	/* board IDs for specific chipsets in alphabetical order */
 	board_ahci_al,
@@ -130,6 +136,13 @@ static const struct ata_port_info ahci_port_info[] = {
 		.udma_mask	= ATA_UDMA6,
 		.port_ops	= &ahci_ops,
 	},
+	[board_ahci_31bit_dma] = {
+		AHCI_HFLAGS	(AHCI_HFLAG_31BIT_ONLY),
+		.flags		= AHCI_FLAG_COMMON,
+		.pio_mask	= ATA_PIO4,
+		.udma_mask	= ATA_UDMA6,
+		.port_ops	= &ahci_ops,
+	},
 	[board_ahci_43bit_dma] = {
 		AHCI_HFLAGS	(AHCI_HFLAG_43BIT_ONLY),
 		.flags		= AHCI_FLAG_COMMON,
@@ -183,6 +196,14 @@ static const struct ata_port_info ahci_port_info[] = {
 	},
 	[board_ahci_yes_fbs] = {
 		AHCI_HFLAGS	(AHCI_HFLAG_YES_FBS),
+		.flags		= AHCI_FLAG_COMMON,
+		.pio_mask	= ATA_PIO4,
+		.udma_mask	= ATA_UDMA6,
+		.port_ops	= &ahci_ops,
+	},
+	[board_ahci_yes_fbs_atapi_dma] = {
+		AHCI_HFLAGS	(AHCI_HFLAG_YES_FBS |
+				 AHCI_HFLAG_ATAPI_DMA_QUIRK),
 		.flags		= AHCI_FLAG_COMMON,
 		.pio_mask	= ATA_PIO4,
 		.udma_mask	= ATA_UDMA6,
@@ -589,6 +610,8 @@ static const struct pci_device_id ahci_pci_tbl[] = {
 	  .driver_data = board_ahci_yes_fbs },
 	{ PCI_DEVICE(PCI_VENDOR_ID_MARVELL_EXT, 0x91a3),
 	  .driver_data = board_ahci_yes_fbs },
+	{ PCI_DEVICE(PCI_VENDOR_ID_MARVELL_EXT, 0x9215),
+	  .driver_data = board_ahci_yes_fbs_atapi_dma },
 	{ PCI_DEVICE(PCI_VENDOR_ID_MARVELL_EXT, 0x9230),
 	  .driver_data = board_ahci_yes_fbs },
 	{ PCI_DEVICE(PCI_VENDOR_ID_MARVELL_EXT, 0x9235),
@@ -625,6 +648,11 @@ static const struct pci_device_id ahci_pci_tbl[] = {
 
 	/* Enmotus */
 	{ PCI_DEVICE(0x1c44, 0x8000), board_ahci },
+
+	/* Sony (PS4) */
+	{ PCI_VDEVICE(SONY, PCI_DEVICE_ID_SONY_AEOLIA_AHCI), board_ahci_31bit_dma },
+	{ PCI_VDEVICE(SONY, PCI_DEVICE_ID_SONY_BELIZE_AHCI), board_ahci_31bit_dma },
+	{ PCI_VDEVICE(SONY, PCI_DEVICE_ID_SONY_BAIKAL_AHCI), board_ahci_31bit_dma },
 
 	/* Loongson */
 	{ PCI_VDEVICE(LOONGSON, 0x7a08), board_ahci },
@@ -1049,9 +1077,12 @@ static int ahci_configure_dma_masks(struct pci_dev *pdev,
 		dma_bits = 64;
 		if (hpriv->flags & AHCI_HFLAG_43BIT_ONLY)
 			dma_bits = 43;
+		if (hpriv->flags & AHCI_HFLAG_31BIT_ONLY)
+			dma_bits = 31;
 	} else {
 		dma_bits = 32;
 	}
+	dev_info(&pdev->dev, "DMA bits = %d\n", dma_bits);
 
 	/*
 	 * If the device fixup already set the dma_mask to some non-standard
@@ -1064,6 +1095,7 @@ static int ahci_configure_dma_masks(struct pci_dev *pdev,
 		return 0;
 
 	rc = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(dma_bits));
+	dev_info(&pdev->dev, "DMA enable\n");
 	if (rc)
 		dev_err(&pdev->dev, "DMA enable failed\n");
 	return rc;
@@ -1399,8 +1431,15 @@ static bool ahci_broken_suspend(struct pci_dev *pdev)
 
 static bool ahci_broken_lpm(struct pci_dev *pdev)
 {
+	/*
+	 * Platforms with LPM problems.
+	 * If driver_data is NULL, there is no existing BIOS version with
+	 * functioning LPM.
+	 * If driver_data is non-NULL, then driver_data contains the DMI BIOS
+	 * build date of the first BIOS version with functioning LPM (i.e. older
+	 * BIOS versions have broken LPM).
+	 */
 	static const struct dmi_system_id sysids[] = {
-		/* Various Lenovo 50 series have LPM issues with older BIOSen */
 		{
 			.matches = {
 				DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
@@ -1435,6 +1474,29 @@ static bool ahci_broken_lpm(struct pci_dev *pdev)
 			 */
 			.driver_data = "20180310", /* 2.35 */
 		},
+		{
+			.matches = {
+				DMI_MATCH(DMI_SYS_VENDOR, "ASUSTeK COMPUTER INC."),
+				DMI_MATCH(DMI_PRODUCT_VERSION, "ASUSPRO D840MB_M840SA"),
+			},
+			/* 320 is broken, there is no known good version. */
+		},
+		{
+			/*
+			 * AMD 500 Series Chipset SATA Controller [1022:43eb]
+			 * on this motherboard timeouts on ports 5 and 6 when
+			 * LPM is enabled, at least with WDC WD20EFAX-68FB5N0
+			 * hard drives. LPM with the same drive works fine on
+			 * all other ports on the same controller.
+			 */
+			.matches = {
+				DMI_MATCH(DMI_BOARD_VENDOR,
+					  "ASUSTeK COMPUTER INC."),
+				DMI_MATCH(DMI_BOARD_NAME,
+					  "ROG STRIX B550-F GAMING (WI-FI)"),
+			},
+			/* 3621 is broken, there is no known good version. */
+		},
 		{ }	/* terminate list */
 	};
 	const struct dmi_system_id *dmi = dmi_first_match(sysids);
@@ -1443,6 +1505,9 @@ static bool ahci_broken_lpm(struct pci_dev *pdev)
 
 	if (!dmi)
 		return false;
+
+	if (!dmi->driver_data)
+		return true;
 
 	dmi_get_date(DMI_BIOS_DATE, &year, &month, &date);
 	snprintf(buf, sizeof(buf), "%04d%02d%02d", year, month, date);
@@ -1665,13 +1730,22 @@ static int ahci_get_irq_vector(struct ata_host *host, int port)
 	return pci_irq_vector(to_pci_dev(host->dev), port);
 }
 
-static int ahci_init_msi(struct pci_dev *pdev, unsigned int n_ports,
+static void ahci_init_irq(struct pci_dev *pdev, unsigned int n_ports,
 			struct ahci_host_priv *hpriv)
 {
 	int nvec;
 
-	if (hpriv->flags & AHCI_HFLAG_NO_MSI)
-		return -ENODEV;
+	#ifdef CONFIG_X86_PS4
+	if (pdev->vendor == PCI_VENDOR_ID_SONY) {
+		apcie_assign_irqs(pdev, n_ports);
+		return;
+	}
+	#endif
+	
+	if (hpriv->flags & AHCI_HFLAG_NO_MSI) {
+		pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_INTX);
+		return;
+	}
 
 	/*
 	 * If number of MSIs is less than number of ports then Sharing Last
@@ -1685,7 +1759,7 @@ static int ahci_init_msi(struct pci_dev *pdev, unsigned int n_ports,
 			if (!(readl(hpriv->mmio + HOST_CTL) & HOST_MRSM)) {
 				hpriv->get_irq_vector = ahci_get_irq_vector;
 				hpriv->flags |= AHCI_HFLAG_MULTI_MSI;
-				return nvec;
+				return;
 			}
 
 			/*
@@ -1700,12 +1774,13 @@ static int ahci_init_msi(struct pci_dev *pdev, unsigned int n_ports,
 
 	/*
 	 * If the host is not capable of supporting per-port vectors, fall
-	 * back to single MSI before finally attempting single MSI-X.
+	 * back to single MSI before finally attempting single MSI-X or
+	 * a legacy INTx.
 	 */
 	nvec = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSI);
 	if (nvec == 1)
-		return nvec;
-	return pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSIX);
+		return;
+	pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSIX | PCI_IRQ_INTX);
 }
 
 static void ahci_mark_external_port(struct ata_port *ap)
@@ -1809,6 +1884,13 @@ static int ahci_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 	int ahci_pci_bar = AHCI_PCI_BAR_STANDARD;
 
 	WARN_ON((int)ATA_MAX_QUEUE > AHCI_MAX_CMDS);
+
+	
+	#ifdef CONFIG_X86_PS4
+	/* This will return negative on non-PS4 platforms */
+	if (apcie_status() == 0)
+		return -EPROBE_DEFER;
+	#endif
 
 	ata_print_version_once(&pdev->dev, DRV_VERSION);
 
@@ -1985,10 +2067,8 @@ static int ahci_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 	}
 	host->private_data = hpriv;
 
-	if (ahci_init_msi(pdev, n_ports, hpriv) < 0) {
-		/* legacy intx interrupts */
-		pci_intx(pdev, 1);
-	}
+	ahci_init_irq(pdev, n_ports, hpriv);
+
 	hpriv->irq = pci_irq_vector(pdev, 0);
 
 	if (!(hpriv->cap & HOST_CAP_SSS) || ahci_ignore_sss)
@@ -2073,7 +2153,257 @@ static void ahci_remove_one(struct pci_dev *pdev)
 				     NULL);
 	pm_runtime_get_noresume(&pdev->dev);
 	ata_pci_remove_one(pdev);
+
+	#ifdef CONFIG_X86_PS4
+	if (pdev->vendor == PCI_VENDOR_ID_SONY) {
+		apcie_free_irqs(pdev->irq, 1);
+	}
+	#endif
 }
+
+#ifdef CONFIG_X86_PS4
+void bpcie_sata_phy_init(struct device *dev, struct ahci_controller *ctlr)
+{
+	int i;
+	u32 v;
+	u32 v2;
+	bool is_phy_gen_3;
+	unsigned int trace_length;
+
+  	dev_info(dev, "Belize SATA PHY init\n");
+
+	for (i = 0; i < 100; i++) {
+		udelay(10000);
+	}
+
+ 	//step 1
+  	bpcie_ahci_write(ctlr->r_mem, 0x178, 0x81);
+
+	v = bpcie_ahci_read(ctlr->r_mem, 0x17c);
+	bpcie_ahci_write(ctlr->r_mem, 0x17c, (v & 0xffffff00) | 1);
+
+	bpcie_ahci_write(ctlr->r_mem, 0x178, 0xa5);
+
+	//step 2
+	v = bpcie_ahci_read(ctlr->r_mem, 0x17c);
+
+	if (ctlr->dev_id == 0x90ca104d || ctlr->dev_id == 0x909f104d || ctlr->dev_id == 0x90d9104d) {
+		is_phy_gen_3 = false;
+		bpcie_ahci_write(ctlr->r_mem, 0x17c, v & 0xfffff3ff);
+	} else {
+		u32 v2 = bpcie_ahci_read(ctlr->r_mem, 0);
+	  	if ((v2 & 0xf00000) != 0x300000) {
+	    		bpcie_ahci_write(ctlr->r_mem, 0x17c, (v & 0xfffff3ff) | 0x400);
+	    		is_phy_gen_3 = false;
+	  	} else {
+	    		 dev_info(dev,"PHY SET GEN3\n");
+	    		 bpcie_ahci_write(ctlr->r_mem, 0x17c, (v & 0xfffff3ff) | 0x800);
+	    		 is_phy_gen_3 = true;
+	  	}
+	}
+
+	//--- step 3 ---
+	if (ctlr->trace_len == 0) {
+	  	trace_length = 6;
+	} else {
+	  	trace_length = ctlr->trace_len & 0x1f;
+	  	if (trace_length >= 0x13) {
+	    		trace_length = 6;
+	  	}
+	}
+
+	dev_info(dev,"Belize SATA PHY Trace length : %d\n",trace_length);
+
+	bpcie_ahci_write(ctlr->r_mem, 0x178, 0xa3);
+
+	//--- step 4 ---
+	v = bpcie_ahci_read(ctlr->r_mem, 0x17c);
+	bpcie_ahci_write(ctlr->r_mem, 0x17c, (v & 0xfffff3ff) | 0x800);
+	bpcie_ahci_write(ctlr->r_mem, 0x178, 0xd0);
+
+	v = bpcie_ahci_read(ctlr->r_mem, 0x17c);
+	bpcie_ahci_write(ctlr->r_mem, 0x17c, (v & 0xfffff800) | 0x441);
+	bpcie_ahci_write(ctlr->r_mem, 0x178, 0xe1);
+
+	v = bpcie_ahci_read(ctlr->r_mem, 0x17c);
+	bpcie_ahci_write(ctlr->r_mem, 0x17c, (v & 0xffffff8f) | 0x60);
+	bpcie_ahci_write(ctlr->r_mem, 0x178, 0xd0);
+
+	v = bpcie_ahci_read(ctlr->r_mem, 0x17c);
+	bpcie_ahci_write(ctlr->r_mem, 0x17c, (v & 0xffff3fff) | 0x8000);
+	bpcie_ahci_write(ctlr->r_mem, 0x178, 0xf1);
+
+	v = bpcie_ahci_read(ctlr->r_mem, 0x17c);
+	bpcie_ahci_write(ctlr->r_mem, 0x17c, (v & 0xfffff3ff) | 0x400);
+	bpcie_ahci_write(ctlr->r_mem, 0x178, 0x48);
+
+	//--- step 5 ---
+	bpcie_ahci_write(ctlr->r_mem, 0x17c, 0x62d8);
+	bpcie_ahci_write(ctlr->r_mem, 0x178, 0xe);
+
+	//--- step 6 ---
+	v = bpcie_ahci_read(ctlr->r_mem, 0x17c);
+	bpcie_ahci_write(ctlr->r_mem, 0x17c, v & 0xffffdfff);
+	bpcie_ahci_write(ctlr->r_mem, 0x178, 0x8d);
+
+	v = bpcie_ahci_read(ctlr->r_mem, 0x17c);
+	bpcie_ahci_write(ctlr->r_mem, 0x17c, v | 1);
+	bpcie_ahci_write(ctlr->r_mem, 0x178, 0x8f);
+
+	v = bpcie_ahci_read(ctlr->r_mem, 0x17c);
+	bpcie_ahci_write(ctlr->r_mem, 0x17c, v | 1);
+	bpcie_ahci_write(ctlr->r_mem, 0x178, 0x91);
+
+	v = bpcie_ahci_read(ctlr->r_mem, 0x17c);
+	bpcie_ahci_write(ctlr->r_mem, 0x17c, v | 1);
+	bpcie_ahci_write(ctlr->r_mem, 0x178, 0x8d);
+
+	//--- step 7 ---
+	v = bpcie_ahci_read(ctlr->r_mem, 0x17c);
+	if (trace_length >= 0xe) {
+		bpcie_ahci_write(ctlr->r_mem, 0x17c, (v & 0xffffffc1) | 0x28);
+	} else {
+		if (trace_length < 0xb) {
+	    		bpcie_ahci_write(ctlr->r_mem, 0x17c, (v & 0xffffffc1) | 8);
+	  	} else {
+	    		bpcie_ahci_write(ctlr->r_mem, 0x17c, (v & 0xffffffc1) | 0x10);
+	  	}
+	}
+
+	bpcie_ahci_write(ctlr->r_mem, 0x178, 0x8f);
+	v = bpcie_ahci_read(ctlr->r_mem, 0x17c);
+	bpcie_ahci_write(ctlr->r_mem, 0x17c, (v & 0xffffffc1) | 0x12);
+
+	//--- step 8 ---
+	bpcie_ahci_write(ctlr->r_mem, 0x178, 0x91);
+	v = bpcie_ahci_read(ctlr->r_mem, 0x17c);
+	if (trace_length < 5) {
+		bpcie_ahci_write(ctlr->r_mem, 0x17c, (v & 0xffffffc1) | 0x24);
+	} else {
+	  	bpcie_ahci_write(ctlr->r_mem, 0x17c, (v & 0xffffffc1) | 0x2a);
+	}
+
+	//--- step 9 ---
+	bpcie_ahci_write(ctlr->r_mem, 0x178, 0xff);
+	bpcie_ahci_write(ctlr->r_mem, 0x17c, 1);
+
+	bpcie_ahci_write(ctlr->r_mem, 0x178, 0x97);
+
+	//--- step 10 ---
+	v = bpcie_ahci_read(ctlr->r_mem, 0x17c);
+	if (is_phy_gen_3) {
+		bpcie_ahci_write(ctlr->r_mem, 0x17c, (v & 0xffffff80) | 0xd3);
+	} else {
+	  	bpcie_ahci_write(ctlr->r_mem, 0x17c, (v & 0xffffff80) | 0xee);
+	}
+
+	bpcie_ahci_write(ctlr->r_mem, 0x178, 0x95);
+	v = bpcie_ahci_read(ctlr->r_mem, 0x17c);
+	bpcie_ahci_write(ctlr->r_mem, 0x17c, (v & 0xffffff00) | 0xee);
+
+	//--- step 11 ---
+	bpcie_ahci_write(ctlr->r_mem, 0x178, 0xff);
+	bpcie_ahci_write(ctlr->r_mem, 0x17c, 0);
+
+	bpcie_ahci_write(ctlr->r_mem, 0x178, 0x8d);
+
+	//--- step 12 ---
+	v = bpcie_ahci_read(ctlr->r_mem, 0x17c);
+	if (trace_length < 0xe) {
+		bpcie_ahci_write(ctlr->r_mem, 0x17c, (v & 0xfffff87f) | 0x900);
+	} else {
+		bpcie_ahci_write(ctlr->r_mem, 0x17c, (v & 0xfffff87f) | 0xe00);
+	}
+
+	//--- step 13 ---
+	bpcie_ahci_write(ctlr->r_mem, 0x178, 0x8f);
+	v = bpcie_ahci_read(ctlr->r_mem, 0x17c);
+	bpcie_ahci_write(ctlr->r_mem, 0x17c, (v & 0xfffff07f) | 0x900);
+
+	bpcie_ahci_write(ctlr->r_mem, 0x178, 0x91);
+
+	//--- step 14 ---
+	v = bpcie_ahci_read(ctlr->r_mem, 0x17c);
+	if (is_phy_gen_3) {
+		bpcie_ahci_write(ctlr->r_mem, 0x17c, (v & 0xfffff87f) | 0xd00);
+	} else {
+		bpcie_ahci_write(ctlr->r_mem, 0x17c, (v & 0xfffff87f) | 0xe80);
+	}
+
+	//--- step 15 ---
+	bpcie_ahci_write(ctlr->r_mem, 0x178, 200);
+	v = bpcie_ahci_read(ctlr->r_mem, 0x17c);
+	bpcie_ahci_write(ctlr->r_mem, 0x17c, v & 0xffffefff);
+
+	bpcie_ahci_write(ctlr->r_mem, 0x178, 10);
+	v = bpcie_ahci_read(ctlr->r_mem, 0x17c);
+	bpcie_ahci_write(ctlr->r_mem, 0x17c, v & 0xffffefff);
+
+	bpcie_ahci_write(ctlr->r_mem, 0x178, 0x82);
+	v = bpcie_ahci_read(ctlr->r_mem, 0x17c);
+	bpcie_ahci_write(ctlr->r_mem, 0x17c, v | 0x1000);
+
+	bpcie_ahci_write(ctlr->r_mem, 0x178, 0xc9);
+	v = bpcie_ahci_read(ctlr->r_mem, 0x17c);
+	bpcie_ahci_write(ctlr->r_mem, 0x17c, v | 0x1000);
+
+	bpcie_ahci_write(ctlr->r_mem, 0x178, 0x84);
+	v = bpcie_ahci_read(ctlr->r_mem, 0x17c);
+	bpcie_ahci_write(ctlr->r_mem, 0x17c, (v & 0xffffffc0) | 0xc);
+
+	bpcie_ahci_write(ctlr->r_mem, 0x178, 0x8d);
+
+	//--- step 16 ---
+	v = bpcie_ahci_read(ctlr->r_mem, 0x17c);
+	v = v & 0xffff0fff;
+	if (trace_length < 0xe) {
+		bpcie_ahci_write(ctlr->r_mem, 0x17c, v | 0x8000);
+	} else {
+		bpcie_ahci_write(ctlr->r_mem, 0x17c, v);
+	}
+
+	//--- step 17 ---
+	bpcie_ahci_write(ctlr->r_mem, 0x178, 0x8f);
+	v = bpcie_ahci_read(ctlr->r_mem, 0x17c);
+	bpcie_ahci_write(ctlr->r_mem, 0x17c, (v & 0xffff0fff) | 0x8000);
+
+	//--- step 18 ---
+	bpcie_ahci_write(ctlr->r_mem, 0xa0, 0);
+	v = bpcie_ahci_read(ctlr->r_mem, 0xa4);
+	bpcie_ahci_write(ctlr->r_mem, 0xa4, v | 0x40);
+
+	//--- step 19 ---
+	if (ctlr->dev_id != 0x909f104d && ctlr->dev_id != 0x90ca104d && ctlr->dev_id != 0x90d9104d) {
+		v2 = 0x73000000;
+	} else {
+		v2 = 0x30000000;
+	}
+
+	//--- step 20 ---
+	bpcie_ahci_write(ctlr->r_mem, 0xa0, 4);
+	v = bpcie_ahci_read(ctlr->r_mem, 0xa4);
+	bpcie_ahci_write(ctlr->r_mem, 0xa4, (v & 0x88ffffff) | v2);
+
+	//--- step 21 ---
+	v = bpcie_ahci_read(ctlr->r_mem, 0xa4);
+
+	//--- step 22 ---
+	for (i = 0; i < 100; i++) {
+		udelay(10000);
+	}
+
+	//--- step 23 ---
+	bpcie_ahci_write(ctlr->r_mem, 0x178, 0xf9);
+	v = bpcie_ahci_read(ctlr->r_mem, 0x17c);
+
+	if (is_phy_gen_3) {
+		dev_info(dev,"Align 90=0x%02x\n",v & 0x7f);
+	}
+	//done!
+}
+
+EXPORT_SYMBOL_GPL(bpcie_sata_phy_init);
+#endif
 
 module_pci_driver(ahci_pci_driver);
 

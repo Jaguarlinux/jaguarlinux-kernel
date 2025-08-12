@@ -431,6 +431,13 @@ static int dm_set_device_limits(struct dm_target *ti, struct dm_dev *dev,
 		return 0;
 	}
 
+	mutex_lock(&q->limits_lock);
+	/*
+	 * BLK_FEAT_ATOMIC_WRITES is not inherited from the bottom device in
+	 * blk_stack_limits(), so do it manually.
+	 */
+	limits->features |= (q->limits.features & BLK_FEAT_ATOMIC_WRITES);
+
 	if (blk_stack_limits(limits, &q->limits,
 			get_start_sect(bdev) + start) < 0)
 		DMWARN("%s: adding target device %pg caused an alignment inconsistency: "
@@ -448,6 +455,7 @@ static int dm_set_device_limits(struct dm_target *ti, struct dm_dev *dev,
 	 */
 	if (!dm_target_has_integrity(ti->type))
 		queue_limits_stack_integrity_bdev(limits, bdev);
+	mutex_unlock(&q->limits_lock);
 	return 0;
 }
 
@@ -523,8 +531,9 @@ static char **realloc_argv(unsigned int *size, char **old_argv)
 		gfp = GFP_NOIO;
 	}
 	argv = kmalloc_array(new_size, sizeof(*argv), gfp);
-	if (argv && old_argv) {
-		memcpy(argv, old_argv, *size * sizeof(*argv));
+	if (argv) {
+		if (old_argv)
+			memcpy(argv, old_argv, *size * sizeof(*argv));
 		*size = new_size;
 	}
 
@@ -695,6 +704,10 @@ int dm_table_add_target(struct dm_table *t, const char *type,
 
 	if (!len) {
 		DMERR("%s: zero-length target", dm_device_name(t->md));
+		return -EINVAL;
+	}
+	if (start + len < start || start + len > LLONG_MAX >> SECTOR_SHIFT) {
+		DMERR("%s: too large device", dm_device_name(t->md));
 		return -EINVAL;
 	}
 
@@ -1045,7 +1058,6 @@ static int dm_table_alloc_md_mempools(struct dm_table *t, struct mapped_device *
 	unsigned int min_pool_size = 0, pool_size;
 	struct dm_md_mempools *pools;
 	unsigned int bioset_flags = 0;
-	bool mempool_needs_integrity = t->integrity_supported;
 
 	if (unlikely(type == DM_TYPE_NONE)) {
 		DMERR("no table type is set, can't allocate mempools");
@@ -1070,8 +1082,6 @@ static int dm_table_alloc_md_mempools(struct dm_table *t, struct mapped_device *
 
 		per_io_data_size = max(per_io_data_size, ti->per_io_data_size);
 		min_pool_size = max(min_pool_size, ti->num_flush_bios);
-
-		mempool_needs_integrity |= ti->mempool_needs_integrity;
 	}
 	pool_size = max(dm_get_reserved_bio_based_ios(), min_pool_size);
 	front_pad = roundup(per_io_data_size,
@@ -1081,14 +1091,8 @@ static int dm_table_alloc_md_mempools(struct dm_table *t, struct mapped_device *
 		__alignof__(struct dm_io)) + DM_IO_BIO_OFFSET;
 	if (bioset_init(&pools->io_bs, pool_size, io_front_pad, bioset_flags))
 		goto out_free_pools;
-	if (mempool_needs_integrity &&
-	    bioset_integrity_create(&pools->io_bs, pool_size))
-		goto out_free_pools;
 init_bs:
 	if (bioset_init(&pools->bs, pool_size, front_pad, 0))
-		goto out_free_pools;
-	if (mempool_needs_integrity &&
-	    bioset_integrity_create(&pools->bs, pool_size))
 		goto out_free_pools;
 
 	t->mempools = pools;
@@ -1177,7 +1181,7 @@ static int dm_keyslot_evict(struct blk_crypto_profile *profile,
 
 	t = dm_get_live_table(md, &srcu_idx);
 	if (!t)
-		return 0;
+		goto put_live_table;
 
 	for (unsigned int i = 0; i < t->num_targets; i++) {
 		struct dm_target *ti = dm_table_get_target(t, i);
@@ -1188,6 +1192,7 @@ static int dm_keyslot_evict(struct blk_crypto_profile *profile,
 					  (void *)key);
 	}
 
+put_live_table:
 	dm_put_live_table(md, srcu_idx);
 	return 0;
 }
@@ -1250,6 +1255,7 @@ static int dm_table_construct_crypto_profile(struct dm_table *t)
 	profile->max_dun_bytes_supported = UINT_MAX;
 	memset(profile->modes_supported, 0xFF,
 	       sizeof(profile->modes_supported));
+	profile->key_types_supported = ~0;
 
 	for (i = 0; i < t->num_targets; i++) {
 		struct dm_target *ti = dm_table_get_target(t, i);
@@ -1492,6 +1498,18 @@ bool dm_table_has_no_data_devices(struct dm_table *t)
 	return true;
 }
 
+bool dm_table_is_wildcard(struct dm_table *t)
+{
+	for (unsigned int i = 0; i < t->num_targets; i++) {
+		struct dm_target *ti = dm_table_get_target(t, i);
+
+		if (!dm_target_is_wildcard(ti->type))
+			return false;
+	}
+
+	return true;
+}
+
 static int device_not_zoned(struct dm_target *ti, struct dm_dev *dev,
 			    sector_t start, sector_t len, void *data)
 {
@@ -1723,8 +1741,12 @@ static int device_not_write_zeroes_capable(struct dm_target *ti, struct dm_dev *
 					   sector_t start, sector_t len, void *data)
 {
 	struct request_queue *q = bdev_get_queue(dev->bdev);
+	int b;
 
-	return !q->limits.max_write_zeroes_sectors;
+	mutex_lock(&q->limits_lock);
+	b = !q->limits.max_write_zeroes_sectors;
+	mutex_unlock(&q->limits_lock);
+	return b;
 }
 
 static bool dm_table_supports_write_zeroes(struct dm_table *t)
@@ -1806,10 +1828,50 @@ static bool dm_table_supports_secure_erase(struct dm_table *t)
 	return true;
 }
 
+static int device_not_atomic_write_capable(struct dm_target *ti,
+			struct dm_dev *dev, sector_t start,
+			sector_t len, void *data)
+{
+	return !bdev_can_atomic_write(dev->bdev);
+}
+
+static bool dm_table_supports_atomic_writes(struct dm_table *t)
+{
+	for (unsigned int i = 0; i < t->num_targets; i++) {
+		struct dm_target *ti = dm_table_get_target(t, i);
+
+		if (!dm_target_supports_atomic_writes(ti->type))
+			return false;
+
+		if (!ti->type->iterate_devices)
+			return false;
+
+		if (ti->type->iterate_devices(ti,
+			device_not_atomic_write_capable, NULL)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool dm_table_supports_size_change(struct dm_table *t, sector_t old_size,
+				   sector_t new_size)
+{
+	if (IS_ENABLED(CONFIG_BLK_DEV_ZONED) && dm_has_zone_plugs(t->md) &&
+	    old_size != new_size) {
+		DMWARN("%s: device has zone write plug resources. "
+		       "Cannot change size",
+		       dm_device_name(t->md));
+		return false;
+	}
+	return true;
+}
+
 int dm_table_set_restrictions(struct dm_table *t, struct request_queue *q,
 			      struct queue_limits *limits)
 {
 	int r;
+	struct queue_limits old_limits;
 
 	if (!dm_table_supports_nowait(t))
 		limits->features &= ~BLK_FEAT_NOWAIT;
@@ -1836,25 +1898,30 @@ int dm_table_set_restrictions(struct dm_table *t, struct request_queue *q,
 	if (dm_table_supports_flush(t))
 		limits->features |= BLK_FEAT_WRITE_CACHE | BLK_FEAT_FUA;
 
-	if (dm_table_supports_dax(t, device_not_dax_capable)) {
+	if (dm_table_supports_dax(t, device_not_dax_capable))
 		limits->features |= BLK_FEAT_DAX;
-		if (dm_table_supports_dax(t, device_not_dax_synchronous_capable))
-			set_dax_synchronous(t->md->dax_dev);
-	} else
+	else
 		limits->features &= ~BLK_FEAT_DAX;
 
-	if (dm_table_any_dev_attr(t, device_dax_write_cache_enabled, NULL))
-		dax_write_cache(t->md->dax_dev, true);
-
 	/* For a zoned table, setup the zone related queue attributes. */
-	if (IS_ENABLED(CONFIG_BLK_DEV_ZONED) &&
-	    (limits->features & BLK_FEAT_ZONED)) {
-		r = dm_set_zones_restrictions(t, q, limits);
-		if (r)
-			return r;
+	if (IS_ENABLED(CONFIG_BLK_DEV_ZONED)) {
+		if (limits->features & BLK_FEAT_ZONED) {
+			r = dm_set_zones_restrictions(t, q, limits);
+			if (r)
+				return r;
+		} else if (dm_has_zone_plugs(t->md)) {
+			DMWARN("%s: device has zone write plug resources. "
+			       "Cannot switch to non-zoned table.",
+			       dm_device_name(t->md));
+			return -EINVAL;
+		}
 	}
 
-	r = queue_limits_set(q, limits);
+	if (dm_table_supports_atomic_writes(t))
+		limits->features |= BLK_FEAT_ATOMIC_WRITES;
+
+	old_limits = queue_limits_start_update(q);
+	r = queue_limits_commit_update(q, limits);
 	if (r)
 		return r;
 
@@ -1865,9 +1932,20 @@ int dm_table_set_restrictions(struct dm_table *t, struct request_queue *q,
 	if (IS_ENABLED(CONFIG_BLK_DEV_ZONED) &&
 	    (limits->features & BLK_FEAT_ZONED)) {
 		r = dm_revalidate_zones(t, q);
-		if (r)
+		if (r) {
+			queue_limits_set(q, &old_limits);
 			return r;
+		}
 	}
+
+	if (IS_ENABLED(CONFIG_BLK_DEV_ZONED))
+		dm_finalize_zone_settings(t, limits);
+
+	if (dm_table_supports_dax(t, device_not_dax_synchronous_capable))
+		set_dax_synchronous(t->md->dax_dev);
+
+	if (dm_table_any_dev_attr(t, device_dax_write_cache_enabled, NULL))
+		dax_write_cache(t->md->dax_dev, true);
 
 	dm_update_crypto_profile(q, t);
 	return 0;

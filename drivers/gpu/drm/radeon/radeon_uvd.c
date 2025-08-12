@@ -124,6 +124,7 @@ int radeon_uvd_init(struct radeon_device *rdev)
 	case CHIP_BONAIRE:
 	case CHIP_KABINI:
 	case CHIP_KAVERI:
+	case CHIP_LIVERPOOL:
 	case CHIP_HAWAII:
 	case CHIP_MULLINS:
 		legacy_fw_name = FIRMWARE_BONAIRE_LEGACY;
@@ -961,7 +962,7 @@ int radeon_uvd_calc_upll_dividers(struct radeon_device *rdev,
 	unsigned optimal_score = ~0;
 
 	/* loop through vco from low to high */
-	vco_min = max(max(vco_min, vclk), dclk);
+	vco_min = max3(vco_min, vclk, dclk);
 	for (vco_freq = vco_min; vco_freq <= vco_max; vco_freq += 100) {
 
 		uint64_t fb_div = (uint64_t)vco_freq * fb_factor;

@@ -21,6 +21,7 @@
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/gpio.h>
+#include <linux/gpio/machine.h>
 #include <linux/pm_runtime.h>
 #include <linux/pm_qos.h>
 #include <linux/debugfs.h>
@@ -36,6 +37,10 @@
 #endif
 
 #include "cqhci.h"
+
+#ifdef CONFIG_X86_PS4
+#include <asm/ps4.h>
+#endif
 
 #include "sdhci.h"
 #include "sdhci-cqhci.h"
@@ -336,6 +341,51 @@ static const struct sdhci_pci_fixes sdhci_intel_qrk = {
 	.quirks		= SDHCI_QUIRK_NO_HISPD_BIT,
 };
 
+#ifdef CONFIG_X86_PS4
+static int aeolia_probe(struct sdhci_pci_chip *chip)
+{
+	chip->num_slots = 1;
+	chip->first_bar = 0;
+	if (apcie_status() == 0)
+		return -EPROBE_DEFER;
+
+	chip->pdev->class &= ~0x0000FF;
+	chip->pdev->class |= PCI_SDHCI_IFDMA;
+	return 0;
+}
+
+static int aeolia_probe_slot(struct sdhci_pci_slot *slot)
+{
+	int err = apcie_assign_irqs(slot->chip->pdev, 1);
+	if (err <= 0) {
+		dev_err(&slot->chip->pdev->dev, "failed to get IRQ: %d\n", err);
+		return -ENODEV;
+	}
+	slot->host->irq = slot->chip->pdev->irq;
+	return 0;
+}
+
+static void aeolia_remove_slot(struct sdhci_pci_slot *slot, int dead)
+{
+	apcie_free_irqs(slot->chip->pdev->irq, 1);
+}
+
+static int aeolia_enable_dma(struct sdhci_pci_slot *slot)
+{
+	if (dma_set_mask_and_coherent(&slot->chip->pdev->dev, DMA_BIT_MASK(31))) {
+		return -EINVAL;
+	}
+	return 0;
+}
+
+static const struct sdhci_pci_fixes sdhci_aeolia = {
+	.probe		= aeolia_probe,
+	.probe_slot	= aeolia_probe_slot,
+	.remove_slot	= aeolia_remove_slot,
+	.enable_dma	= aeolia_enable_dma,
+};
+#endif
+
 static int mrst_hc_probe_slot(struct sdhci_pci_slot *slot)
 {
 	slot->host->mmc->caps |= MMC_CAP_8_BIT_DATA;
@@ -609,8 +659,12 @@ static void sdhci_intel_set_power(struct sdhci_host *host, unsigned char mode,
 
 	sdhci_set_power(host, mode, vdd);
 
-	if (mode == MMC_POWER_OFF)
+	if (mode == MMC_POWER_OFF) {
+		if (slot->chip->pdev->device == PCI_DEVICE_ID_INTEL_APL_SD ||
+		    slot->chip->pdev->device == PCI_DEVICE_ID_INTEL_BYT_SD)
+			usleep_range(15000, 17500);
 		return;
+	}
 
 	/*
 	 * Bus power might not enable after D3 -> D0 transition due to the
@@ -1236,6 +1290,29 @@ static const struct sdhci_pci_fixes sdhci_intel_byt_sdio = {
 	.priv_size	= sizeof(struct intel_host),
 };
 
+/* DMI quirks for devices with missing or broken CD GPIO info */
+static const struct gpiod_lookup_table vexia_edu_atla10_cd_gpios = {
+	.dev_id = "0000:00:12.0",
+	.table = {
+		GPIO_LOOKUP("INT33FC:00", 38, "cd", GPIO_ACTIVE_HIGH),
+		{ }
+	},
+};
+
+static const struct dmi_system_id sdhci_intel_byt_cd_gpio_override[] = {
+	{
+		/* Vexia Edu Atla 10 tablet 9V version */
+		.matches = {
+			DMI_MATCH(DMI_BOARD_VENDOR, "AMI Corporation"),
+			DMI_MATCH(DMI_BOARD_NAME, "Aptio CRB"),
+			/* Above strings are too generic, also match on BIOS date */
+			DMI_MATCH(DMI_BIOS_DATE, "08/25/2014"),
+		},
+		.driver_data = (void *)&vexia_edu_atla10_cd_gpios,
+	},
+	{ }
+};
+
 static const struct sdhci_pci_fixes sdhci_intel_byt_sd = {
 #ifdef CONFIG_PM_SLEEP
 	.resume		= byt_resume,
@@ -1254,6 +1331,7 @@ static const struct sdhci_pci_fixes sdhci_intel_byt_sd = {
 	.add_host	= byt_add_host,
 	.remove_slot	= byt_remove_slot,
 	.ops		= &sdhci_intel_byt_ops,
+	.cd_gpio_override = sdhci_intel_byt_cd_gpio_override,
 	.priv_size	= sizeof(struct intel_host),
 };
 
@@ -1926,6 +2004,12 @@ static const struct pci_device_id pci_ids[] = {
 	SDHCI_PCI_DEVICE(O2, GG8_9863, o2),
 	SDHCI_PCI_DEVICE(ARASAN, PHY_EMMC, arasan),
 	SDHCI_PCI_DEVICE(SYNOPSYS, DWC_MSHC, snps),
+	#ifdef CONFIG_X86_PS4
+	SDHCI_PCI_DEVICE(SONY, AEOLIA_SDHCI, aeolia),
+	SDHCI_PCI_DEVICE(SONY, BELIZE_SDHCI, aeolia),
+	// TODO (ps4patches): What is this doing in comments?
+	//SDHCI_PCI_DEVICE(SONY, BAIKAL_SDHCI, aeolia),
+	#endif
 	SDHCI_PCI_DEVICE(GLI, 9750, gl9750),
 	SDHCI_PCI_DEVICE(GLI, 9755, gl9755),
 	SDHCI_PCI_DEVICE(GLI, 9763E, gl9763e),
@@ -1960,6 +2044,10 @@ int sdhci_pci_enable_dma(struct sdhci_host *host)
 	}
 
 	pci_set_master(pdev);
+
+	if (slot->chip->fixes && slot->chip->fixes->enable_dma) {
+		return slot->chip->fixes->enable_dma(slot);
+	}
 
 	return 0;
 }
@@ -2055,6 +2143,42 @@ static const struct dev_pm_ops sdhci_pci_pm_ops = {
  *                                                                           *
 \*****************************************************************************/
 
+static struct gpiod_lookup_table *sdhci_pci_add_gpio_lookup_table(
+	struct sdhci_pci_chip *chip)
+{
+	struct gpiod_lookup_table *cd_gpio_lookup_table;
+	const struct dmi_system_id *dmi_id = NULL;
+	size_t count;
+
+	if (chip->fixes && chip->fixes->cd_gpio_override)
+		dmi_id = dmi_first_match(chip->fixes->cd_gpio_override);
+
+	if (!dmi_id)
+		return NULL;
+
+	cd_gpio_lookup_table = dmi_id->driver_data;
+	for (count = 0; cd_gpio_lookup_table->table[count].key; count++)
+		;
+
+	cd_gpio_lookup_table = kmemdup(dmi_id->driver_data,
+				       /* count + 1 terminating entry */
+				       struct_size(cd_gpio_lookup_table, table, count + 1),
+				       GFP_KERNEL);
+	if (!cd_gpio_lookup_table)
+		return ERR_PTR(-ENOMEM);
+
+	gpiod_add_lookup_table(cd_gpio_lookup_table);
+	return cd_gpio_lookup_table;
+}
+
+static void sdhci_pci_remove_gpio_lookup_table(struct gpiod_lookup_table *lookup_table)
+{
+	if (lookup_table) {
+		gpiod_remove_lookup_table(lookup_table);
+		kfree(lookup_table);
+	}
+}
+
 static struct sdhci_pci_slot *sdhci_pci_probe_slot(
 	struct pci_dev *pdev, struct sdhci_pci_chip *chip, int first_bar,
 	int slotno)
@@ -2130,8 +2254,19 @@ static struct sdhci_pci_slot *sdhci_pci_probe_slot(
 		device_init_wakeup(&pdev->dev, true);
 
 	if (slot->cd_idx >= 0) {
+		struct gpiod_lookup_table *cd_gpio_lookup_table;
+
+		cd_gpio_lookup_table = sdhci_pci_add_gpio_lookup_table(chip);
+		if (IS_ERR(cd_gpio_lookup_table)) {
+			ret = PTR_ERR(cd_gpio_lookup_table);
+			goto remove;
+		}
+
 		ret = mmc_gpiod_request_cd(host->mmc, "cd", slot->cd_idx,
 					   slot->cd_override_level, 0);
+
+		sdhci_pci_remove_gpio_lookup_table(cd_gpio_lookup_table);
+
 		if (ret && ret != -EPROBE_DEFER)
 			ret = mmc_gpiod_request_cd(host->mmc, NULL,
 						   slot->cd_idx,
@@ -2270,6 +2405,7 @@ static int sdhci_pci_probe(struct pci_dev *pdev,
 		chip->allow_runtime_pm = chip->fixes->allow_runtime_pm;
 	}
 	chip->num_slots = slots;
+	chip->first_bar = first_bar;
 	chip->pm_retune = true;
 	chip->rpm_retune = true;
 
@@ -2284,7 +2420,11 @@ static int sdhci_pci_probe(struct pci_dev *pdev,
 	slots = chip->num_slots;	/* Quirk may have changed this */
 
 	for (i = 0; i < slots; i++) {
+		#ifdef CONFIG_X86_PS4
+		slot = sdhci_pci_probe_slot(pdev, chip, chip->first_bar, i);
+		#else
 		slot = sdhci_pci_probe_slot(pdev, chip, first_bar, i);
+		#endif
 		if (IS_ERR(slot)) {
 			for (i--; i >= 0; i--)
 				sdhci_pci_remove_slot(chip->slots[i]);

@@ -109,6 +109,7 @@
 #include "amdgpu_mca.h"
 #include "amdgpu_aca.h"
 #include "amdgpu_ras.h"
+#include "amdgpu_cper.h"
 #include "amdgpu_xcp.h"
 #include "amdgpu_seq64.h"
 #include "amdgpu_reg_state.h"
@@ -309,7 +310,10 @@ extern int amdgpu_wbrf;
 #define CIK_CURSOR_WIDTH 128
 #define CIK_CURSOR_HEIGHT 128
 
-/* smart shift bias level limits */
+#define LVP_CURSOR_WIDTH 64 
+#define LVP_CURSOR_HEIGHT 64
+
+/* smasrt shift bias level limits */
 #define AMDGPU_SMARTSHIFT_MAX_BIAS (100)
 #define AMDGPU_SMARTSHIFT_MIN_BIAS (-100)
 
@@ -352,7 +356,6 @@ enum amdgpu_kiq_irq {
 	AMDGPU_CP_KIQ_IRQ_DRIVER0 = 0,
 	AMDGPU_CP_KIQ_IRQ_LAST
 };
-#define SRIOV_USEC_TIMEOUT  1200000 /* wait 12 * 100ms for SRIOV */
 #define MAX_KIQ_REG_WAIT       5000 /* in usecs, 5ms */
 #define MAX_KIQ_REG_BAILOUT_INTERVAL   5 /* in msecs, 5ms */
 #define MAX_KIQ_REG_TRY 1000
@@ -415,6 +418,7 @@ bool amdgpu_get_bios(struct amdgpu_device *adev);
 bool amdgpu_read_bios(struct amdgpu_device *adev);
 bool amdgpu_soc15_read_bios_from_rom(struct amdgpu_device *adev,
 				     u8 *bios, u32 length_bytes);
+void amdgpu_bios_release(struct amdgpu_device *adev);
 /*
  * Clocks
  */
@@ -880,6 +884,7 @@ struct amdgpu_device {
 	bool				need_swiotlb;
 	bool				accel_working;
 	struct notifier_block		acpi_nb;
+	struct notifier_block		pm_nb;
 	struct amdgpu_i2c_chan		*i2c_bus[AMDGPU_MAX_I2C_BUS];
 	struct debugfs_blob_wrapper     debugfs_vbios_blob;
 	struct debugfs_blob_wrapper     debugfs_discovery_blob;
@@ -1089,6 +1094,9 @@ struct amdgpu_device {
 	/* ACA */
 	struct amdgpu_aca		aca;
 
+	/* CPER */
+	struct amdgpu_cper		cper;
+
 	struct amdgpu_ip_block          ip_blocks[AMDGPU_MAX_IP_NUM];
 	uint32_t		        harvest_ip_mask;
 	int				num_ip_blocks;
@@ -1118,6 +1126,7 @@ struct amdgpu_device {
 	bool				in_s3;
 	bool				in_s4;
 	bool				in_s0ix;
+	suspend_state_t			last_suspend_state;
 
 	enum pp_mp1_state               mp1_state;
 	struct amdgpu_doorbell_index doorbell_index;
@@ -1148,6 +1157,7 @@ struct amdgpu_device {
 	struct ratelimit_state		throttling_logging_rs;
 	uint32_t                        ras_hw_enabled;
 	uint32_t                        ras_enabled;
+	bool                            ras_default_ecc_enabled;
 
 	bool                            no_hw_access;
 	struct pci_saved_state          *pci_state;
@@ -1174,7 +1184,6 @@ struct amdgpu_device {
 
 	struct work_struct		reset_work;
 
-	bool                            job_hang;
 	bool                            dc_enabled;
 	/* Mask of active clusters */
 	uint32_t			aid_mask;
@@ -1186,12 +1195,24 @@ struct amdgpu_device {
 	bool                            debug_use_vram_fw_buf;
 	bool                            debug_enable_ras_aca;
 	bool                            debug_exp_resets;
+	bool                            debug_disable_gpu_ring_reset;
 
-	bool				enforce_isolation[MAX_XCP];
-	/* Added this mutex for cleaner shader isolation between GFX and compute processes */
+	/* Protection for the following isolation structure */
 	struct mutex                    enforce_isolation_mutex;
+	bool				enforce_isolation[MAX_XCP];
+	struct amdgpu_isolation {
+		void			*owner;
+		struct dma_fence	*spearhead;
+		struct amdgpu_sync	active;
+		struct amdgpu_sync	prev;
+	} isolation[MAX_XCP];
 
 	struct amdgpu_init_level *init_lvl;
+
+	/* This flag is used to determine how VRAM allocations are handled for APUs
+	 * in KFD: VRAM or GTT.
+	 */
+	bool                            apu_prefer_gtt;
 };
 
 static inline uint32_t amdgpu_ip_version(const struct amdgpu_device *adev,
@@ -1470,6 +1491,9 @@ void amdgpu_device_pcie_port_wreg(struct amdgpu_device *adev,
 struct dma_fence *amdgpu_device_get_gang(struct amdgpu_device *adev);
 struct dma_fence *amdgpu_device_switch_gang(struct amdgpu_device *adev,
 					    struct dma_fence *gang);
+struct dma_fence *amdgpu_device_enforce_isolation(struct amdgpu_device *adev,
+						  struct amdgpu_ring *ring,
+						  struct amdgpu_job *job);
 bool amdgpu_device_has_display_hardware(struct amdgpu_device *adev);
 ssize_t amdgpu_get_soft_full_reset_mask(struct amdgpu_ring *ring);
 ssize_t amdgpu_show_reset_mask(char *buf, uint32_t supported_reset);
@@ -1593,11 +1617,9 @@ static inline void amdgpu_acpi_get_backlight_caps(struct amdgpu_dm_backlight_cap
 #if defined(CONFIG_ACPI) && defined(CONFIG_SUSPEND)
 bool amdgpu_acpi_is_s3_active(struct amdgpu_device *adev);
 bool amdgpu_acpi_is_s0ix_active(struct amdgpu_device *adev);
-void amdgpu_choose_low_power_state(struct amdgpu_device *adev);
 #else
 static inline bool amdgpu_acpi_is_s0ix_active(struct amdgpu_device *adev) { return false; }
 static inline bool amdgpu_acpi_is_s3_active(struct amdgpu_device *adev) { return false; }
-static inline void amdgpu_choose_low_power_state(struct amdgpu_device *adev) { }
 #endif
 
 void amdgpu_register_gpu_instance(struct amdgpu_device *adev);

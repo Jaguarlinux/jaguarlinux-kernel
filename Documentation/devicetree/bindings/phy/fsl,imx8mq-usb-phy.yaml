@@ -63,8 +63,7 @@ properties:
   fsl,phy-tx-vboost-level-microvolt:
     description:
       Adjust the boosted transmit launch pk-pk differential amplitude
-    minimum: 880
-    maximum: 1120
+    enum: [844, 1008, 1156]
 
   fsl,phy-comp-dis-tune-percent:
     description:
@@ -113,11 +112,8 @@ allOf:
           maxItems: 1
 
   - if:
-      properties:
-        compatible:
-          contains:
-            enum:
-              - fsl,imx95-usb-phy
+      required:
+        - orientation-switch
     then:
       $ref: /schemas/usb/usb-switch.yaml#
 

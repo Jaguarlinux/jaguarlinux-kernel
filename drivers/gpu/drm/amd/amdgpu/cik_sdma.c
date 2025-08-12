@@ -66,6 +66,10 @@ MODULE_FIRMWARE("amdgpu/kabini_sdma.bin");
 MODULE_FIRMWARE("amdgpu/kabini_sdma1.bin");
 MODULE_FIRMWARE("amdgpu/mullins_sdma.bin");
 MODULE_FIRMWARE("amdgpu/mullins_sdma1.bin");
+MODULE_FIRMWARE("amdgpu/liverpool_sdma.bin");
+MODULE_FIRMWARE("amdgpu/liverpool_sdma1.bin");
+MODULE_FIRMWARE("amdgpu/gladius_sdma.bin");
+MODULE_FIRMWARE("amdgpu/gladius_sdma1.bin");
 
 u32 amdgpu_cik_gpu_check_soft_reset(struct amdgpu_device *adev);
 
@@ -127,15 +131,23 @@ static int cik_sdma_init_microcode(struct amdgpu_device *adev)
 	case CHIP_MULLINS:
 		chip_name = "mullins";
 		break;
+	case CHIP_LIVERPOOL:
+		chip_name = "liverpool";
+		break;
+	case CHIP_GLADIUS:
+		chip_name = "gladius";
+		break;
 	default: BUG();
 	}
 
 	for (i = 0; i < adev->sdma.num_instances; i++) {
 		if (i == 0)
 			err = amdgpu_ucode_request(adev, &adev->sdma.instance[i].fw,
+						   AMDGPU_UCODE_REQUIRED,
 						   "amdgpu/%s_sdma.bin", chip_name);
 		else
 			err = amdgpu_ucode_request(adev, &adev->sdma.instance[i].fw,
+						   AMDGPU_UCODE_REQUIRED,
 						   "amdgpu/%s_sdma1.bin", chip_name);
 		if (err)
 			goto out;
@@ -617,11 +629,20 @@ static int cik_sdma_ring_test_ring(struct amdgpu_ring *ring)
 	if (r)
 		goto error_free_wb;
 
-	amdgpu_ring_write(ring, SDMA_PACKET(SDMA_OPCODE_WRITE, SDMA_WRITE_SUB_OPCODE_LINEAR, 0));
-	amdgpu_ring_write(ring, lower_32_bits(gpu_addr));
-	amdgpu_ring_write(ring, upper_32_bits(gpu_addr));
-	amdgpu_ring_write(ring, 1); /* number of DWs to follow */
-	amdgpu_ring_write(ring, 0xDEADBEEF);
+	/* The SDMA_OPCODE_WRITE opcode is broken in the ring on Liverpool */
+	if (adev->asic_type == CHIP_LIVERPOOL) {
+		amdgpu_ring_write(ring, SDMA_PACKET(SDMA_OPCODE_CONSTANT_FILL, 0, SDMA_CONSTANT_FILL_EXTRA_SIZE(2)));
+		amdgpu_ring_write(ring, lower_32_bits(gpu_addr));
+		amdgpu_ring_write(ring, upper_32_bits(gpu_addr));
+		amdgpu_ring_write(ring, 0xDEADBEEF);
+		amdgpu_ring_write(ring, 4); /* number of bytes */
+	} else {
+		amdgpu_ring_write(ring, SDMA_PACKET(SDMA_OPCODE_WRITE, SDMA_WRITE_SUB_OPCODE_LINEAR, 0));
+		amdgpu_ring_write(ring, lower_32_bits(gpu_addr));
+		amdgpu_ring_write(ring, upper_32_bits(gpu_addr));
+		amdgpu_ring_write(ring, 1); /* number of DWs to follow */
+		amdgpu_ring_write(ring, 0xDEADBEEF);
+	}
 	amdgpu_ring_commit(ring);
 
 	for (i = 0; i < adev->usec_timeout; i++) {
@@ -696,7 +717,7 @@ static int cik_sdma_ring_test_ib(struct amdgpu_ring *ring, long timeout)
 		r = -EINVAL;
 
 err1:
-	amdgpu_ib_free(adev, &ib, NULL);
+	amdgpu_ib_free(&ib, NULL);
 	dma_fence_put(f);
 err0:
 	amdgpu_device_wb_free(adev, index);
@@ -1023,9 +1044,9 @@ static int cik_sdma_resume(struct amdgpu_ip_block *ip_block)
 	return cik_sdma_hw_init(ip_block);
 }
 
-static bool cik_sdma_is_idle(void *handle)
+static bool cik_sdma_is_idle(struct amdgpu_ip_block *ip_block)
 {
-	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+	struct amdgpu_device *adev = ip_block->adev;
 	u32 tmp = RREG32(mmSRBM_STATUS2);
 
 	if (tmp & (SRBM_STATUS2__SDMA_BUSY_MASK |
@@ -1189,11 +1210,11 @@ static int cik_sdma_process_illegal_inst_irq(struct amdgpu_device *adev,
 	return 0;
 }
 
-static int cik_sdma_set_clockgating_state(void *handle,
+static int cik_sdma_set_clockgating_state(struct amdgpu_ip_block *ip_block,
 					  enum amd_clockgating_state state)
 {
 	bool gate = false;
-	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+	struct amdgpu_device *adev = ip_block->adev;
 
 	if (state == AMD_CG_STATE_GATE)
 		gate = true;
@@ -1204,7 +1225,7 @@ static int cik_sdma_set_clockgating_state(void *handle,
 	return 0;
 }
 
-static int cik_sdma_set_powergating_state(void *handle,
+static int cik_sdma_set_powergating_state(struct amdgpu_ip_block *ip_block,
 					  enum amd_powergating_state state)
 {
 	return 0;
